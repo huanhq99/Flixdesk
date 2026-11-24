@@ -78,7 +78,7 @@ updates = {
     "COTURN_STATELESS_NONCE_SECRET": sys.argv[7],
     "ADMIN_USERNAME": sys.argv[8],
     "ADMIN_PASSWORD": sys.argv[9],
-    "CROSSDESK_IMAGE": "flixdesk/flixdesk-server:latest",
+    "CROSSDESK_IMAGE": "huanhq99/flixdesk-server:latest",
     "COTURN_REALM": "flixdesk",
 }
 
@@ -100,4 +100,4 @@ PY
 echo "Generated $ENV_FILE successfully."
 echo "Next steps:"
 echo "  1. Review $ENV_FILE"
-echo "  2. Run: cd server && docker compose up -d --build"
+echo "  2. Run: cd server && docker compose pull && docker compose up -d --no-build"

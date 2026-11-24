@@ -45,18 +45,32 @@ Flixdesk/
 
 脚本会自动调用 `openssl rand -hex 32` 生成 `COTURN_AUTH_SECRET` 与 `COTURN_STATELESS_NONCE_SECRET` 并写入 `server/.env`（已被 `.gitignore` 忽略，不会提交到 Git）。
 
-### 3. 启动服务端
+### 3. 启动服务端（Docker Hub 镜像部署）
+
+本仓库已配置 GitHub Actions（`.github/workflows/server-docker.yml`），会自动编译 `linux/amd64` 与 `linux/arm64` 服务端并推送到 Docker Hub 镜像 `huanhq99/flixdesk-server:latest`（需在 GitHub 仓库的 **Settings → Secrets → Actions** 中配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`）。
+
+镜像发布后，在服务器上直接拉取并启动即可（无需在服务器编译 C++）：
 
 ```bash
 cd server
-# 从本仓库源码构建并启动（推荐，完全独立于上游镜像）
-docker compose up -d --build
+docker compose pull
+docker compose up -d --no-build
 
 # 查看运行状态
 docker compose ps
 ```
 
-### 4. TLS 证书说明
+### 4. 访问内置 Web 管理面板
+
+只要在生成 `.env` 时传入了 `--admin-user` 和 `--admin-pass`（或手动在 `server/.env` 中同时填写 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 后重启容器），即可在浏览器访问内置管理后台：
+
+```text
+https://<你的服务器IP或域名>:9099/admin
+```
+
+支持查看各端在线数、控制端日活、管理与断开活动会话，以及设备数据查询 / 导出 / 清理。
+
+### 5. TLS 证书说明
 
 服务端约定读取以下证书文件名（位于 `${CROSSDESK_DATA_DIR}/certs/`，默认 `/var/lib/crossdesk/certs/`）：
 - `api.crossdesk.cn_bundle.crt`：服务端证书链
