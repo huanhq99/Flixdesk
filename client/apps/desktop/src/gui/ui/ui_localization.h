@@ -1,0 +1,338 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2026-09-04
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _UI_LOCALIZATION_H_
+#define _UI_LOCALIZATION_H_
+
+#include <slint.h>
+
+#include <string>
+
+#include "crossdesk_ui.h"
+#include "localization.h"
+
+namespace crossdesk::ui_localization {
+
+inline slint::SharedString Text(const std::string& value) {
+  return slint::SharedString(value);
+}
+
+template <typename Component>
+void ApplyServerStrings(const Component& component, int language_index) {
+  const int language = localization::detail::ClampLanguageIndex(language_index);
+  auto& strings = component->template global<ui::ServerStrings>();
+  const auto& badge = localization::Literal("被控中 · {0} 台", language);
+  const auto count = badge.find("{0}");
+  strings.set_controlled_prefix(Text(badge.substr(0, count)));
+  strings.set_controlled_suffix(Text(count == std::string::npos ? "" : badge.substr(count + 3)));
+  strings.set_heading(Text(localization::server_heading[language]));
+  strings.set_connected(Text(localization::server_connected[language]));
+  strings.set_send_file(Text(localization::server_send_file[language]));
+  strings.set_disconnect(Text(localization::server_disconnect[language]));
+  strings.set_disconnect_one(Text(localization::disconnect[language]));
+  strings.set_disconnect_all(Text(localization::server_disconnect_all[language]));
+  strings.set_confirm_disconnect(Text(localization::server_confirm_disconnect[language]));
+  strings.set_cancel(Text(localization::cancel[language]));
+}
+
+inline int ApplyMainWindowStrings(
+    const slint::ComponentHandle<ui::MainWindow>& window,
+    int language_index) {
+  const int language =
+      localization::detail::ClampLanguageIndex(language_index);
+  auto& gallery = window->global<ui::GalleryStrings>();
+  gallery.set_language(language);
+  const auto& retry = localization::Literal("请在 {0} 秒后重试", language);
+  const auto split = retry.find("{0}");
+  gallery.set_retry_prefix(Text(retry.substr(0, split)));
+  gallery.set_retry_suffix(Text(split == std::string::npos ? "" : retry.substr(split + 3)));
+  std::vector<slint::SharedString> literals;
+  for (const auto* key : localization::detail::kSlintLiterals)
+    literals.push_back(Text(localization::Literal(key, language)));
+  gallery.set_texts(std::make_shared<slint::VectorModel<slint::SharedString>>(literals));
+  std::vector<slint::SharedString> languages;
+  for (const auto& option : localization::GetSupportedLanguages())
+    languages.push_back(Text(option.display_name));
+  languages.push_back(Text(localization::Literal("跟随系统", language)));
+  window->set_language_options(std::make_shared<slint::VectorModel<slint::SharedString>>(languages));
+  auto& trust = window->global<ui::TrustStrings>();
+  trust.set_title(Text(localization::Literal("可信设备", language)));
+  trust.set_only(Text(localization::Literal("仅允许可信设备控制", language)));
+  trust.set_manage(Text(localization::Literal("管理可信设备", language)));
+  trust.set_copy(Text(localization::Literal("复制配对信息", language)));
+  trust.set_import_title(Text(localization::Literal("添加可信设备", language)));
+  trust.set_add(Text(localization::Literal("添加", language)));
+  trust.set_placeholder(Text(localization::Literal("粘贴控制端的配对信息", language)));
+  trust.set_confirm(Text(localization::Literal("请核对控制端指纹。", language)));
+  trust.set_saved(Text(localization::Literal("已信任的设备", language)));
+  trust.set_sharing(Text(localization::Literal("本机配对信息", language)));
+  trust.set_show_fingerprint(Text(localization::Literal("查看指纹", language)));
+  trust.set_hide_fingerprint(Text(localization::Literal("收起指纹", language)));
+  trust.set_empty(Text(localization::Literal("暂无可信设备", language)));
+  trust.set_candidates(Text(localization::Literal("可添加的已连接设备", language)));
+  trust.set_trust(Text(localization::Literal("信任此设备", language)));
+  trust.set_remove(Text(localization::Literal("移除信任", language)));
+  trust.set_close(Text(localization::message_close[language]));
+  auto& feedback = window->global<ui::FeedbackStrings>();
+  feedback.set_title(Text(localization::Literal("反馈与建议", language)));
+  feedback.set_github(Text(localization::Literal("前往 GitHub 反馈", language)));
+  feedback.set_github_hint(Text(localization::Literal("报告问题或提出功能建议。", language)));
+  feedback.set_export(Text(localization::Literal("导出诊断日志", language)));
+  feedback.set_export_hint(Text(localization::Literal("将 CrossDesk、MiniRTC 日志和基本版本信息保存为 ZIP 文件。", language)));
+  feedback.set_exporting(Text(localization::Literal("正在导出…", language)));
+  feedback.set_attachment_hint(Text(localization::Literal("请在 GitHub Issue 中附上导出的 ZIP 日志包，便于排查问题。", language)));
+  feedback.set_close(Text(localization::message_close[language]));
+  auto& strings = window->global<ui::UiStrings>();
+  strings.set_system_permissions(Text(localization::system_permissions[language]));
+  strings.set_permission_migration_running(Text(localization::permission_migration_running[language]));
+  strings.set_permission_migration_failed(Text(localization::permission_migration_failed[language]));
+  strings.set_retry_permission_migration(Text(localization::retry_permission_migration[language]));
+  strings.set_permission_later(Text(localization::permission_later[language]));
+  strings.set_window_minimize(Text(localization::window_minimize[language]));
+  strings.set_window_close(Text(localization::window_close[language]));
+  strings.set_save(Text(localization::save[language]));
+  strings.set_copyright(Text(localization::copyright_notice[language]));
+  strings.set_license(Text(localization::license_notice[language]));
+  auto& messages = window->global<ui::MessageStrings>();
+  messages.set_messages(Text(localization::messages[language]));
+  messages.set_unread(Text(localization::message_unread[language]));
+  messages.set_read(Text(localization::message_read[language]));
+  messages.set_read_all(Text(localization::message_read_all[language]));
+  messages.set_empty(Text(localization::message_empty[language]));
+  messages.set_select_message(Text(localization::message_select[language]));
+  messages.set_loading(Text(localization::message_loading[language]));
+  messages.set_read_save_error(Text(localization::message_read_save_error[language]));
+  messages.set_close(Text(localization::message_close[language]));
+  messages.set_delete_message(Text(localization::message_delete[language]));
+  messages.set_delete_title(Text(localization::message_delete_title[language]));
+  messages.set_delete_confirmation(Text(localization::message_delete_confirmation[language]));
+  messages.set_delete_error(Text(localization::message_delete_error[language]));
+  messages.set_cancel(Text(localization::cancel[language]));
+
+  strings.set_local_desktop(Text(localization::local_desktop[language]));
+  strings.set_remote_desktop(Text(localization::remote_desktop[language]));
+  strings.set_recent_connections(
+      Text(localization::recent_connections[language]));
+  strings.set_local_id(Text(localization::local_id[language]));
+  strings.set_device_name(Text(localization::device_name[language]));
+  strings.set_remote_id(Text(localization::remote_id[language]));
+  strings.set_online(Text(localization::online[language]));
+  strings.set_offline(Text(localization::offline[language]));
+  strings.set_password(Text(localization::password[language]));
+  strings.set_refresh_password(Text(localization::refresh_password[language]));
+  strings.set_copied(
+      Text(localization::local_id_copied_to_clipboard[language]));
+  strings.set_connect(Text(localization::connect[language]));
+  strings.set_settings(Text(localization::settings[language]));
+  strings.set_about(Text(localization::about[language]));
+  strings.set_sponsorship_title(Text(localization::sponsorship_title[language]));
+  strings.set_sponsor_via_afdian(Text(localization::sponsor_via_afdian[language]));
+  strings.set_ok(Text(localization::ok[language]));
+  strings.set_cancel(Text(localization::cancel[language]));
+  strings.set_new_password(Text(localization::new_password[language]));
+  strings.set_invalid_password(Text(localization::password_format_invalid[language]));
+  strings.set_edit_alias(
+      Text(localization::input_connection_alias[language]));
+  strings.set_delete_connection(
+      Text(localization::delete_connection[language]));
+  strings.set_confirm_delete(
+      Text(localization::confirm_delete_connection[language]));
+  strings.set_language(Text(localization::language[language]));
+  strings.set_codec(Text(localization::video_encode_format[language]));
+  strings.set_pause_video_when_minimized(
+      Text(localization::pause_video_when_minimized[language]));
+  strings.set_pause_video_when_minimized_hint(
+      Text(localization::pause_video_when_minimized_hint[language]));
+  strings.set_force_relay(Text(localization::force_relay[language]));
+  strings.set_self_hosted(
+      Text(localization::self_hosted_server_config[language]));
+  strings.set_autostart(Text(localization::enable_autostart[language]));
+  strings.set_daemon(Text(localization::enable_daemon[language]));
+  strings.set_save_remote_previews(Text(localization::save_remote_previews[language]));
+  strings.set_unknown_platform(Text(localization::unknown_platform[language]));
+  strings.set_privacy_local_unlock(Text(localization::privacy_local_unlock[language]));
+  strings.set_privacy_black_screen(Text(localization::privacy_black_screen[language]));
+  strings.set_privacy_on_connect(Text(localization::privacy_on_connect[language]));
+  strings.set_lock_on_disconnect(Text(localization::lock_on_disconnect[language]));
+  strings.set_file_save_path(
+      Text(localization::file_transfer_save_path[language]));
+  strings.set_default_desktop(Text(localization::default_desktop[language]));
+  strings.set_server_host(
+      Text(localization::self_hosted_server_address[language]));
+  strings.set_server_port(
+      Text(localization::self_hosted_server_port[language]));
+  strings.set_version(Text(localization::version[language]));
+  strings.set_signal_connected(Text(localization::signal_connected[language]));
+  strings.set_signal_disconnected(
+      Text(localization::signal_disconnected[language]));
+  strings.set_tls_error(Text(localization::signal_tls_cert_error[language]));
+  strings.set_signal_reconnect(
+      Text(localization::signal_reconnect[language]));
+  strings.set_signal_reconnecting(
+      Text(localization::signal_reconnecting[language]));
+  strings.set_update_available(
+      Text(localization::new_version_available[language]));
+  strings.set_new_version(Text(localization::new_version[language]));
+  strings.set_check_for_updates(Text(localization::check_for_updates[language]));
+  strings.set_checking_for_updates(
+      Text(localization::checking_for_updates[language]));
+  strings.set_up_to_date(Text(localization::up_to_date[language]));
+  strings.set_update_check_failed(
+      Text(localization::update_check_failed[language]));
+  strings.set_release_notes(Text(localization::release_notes[language]));
+  strings.set_view_release_notes(Text(localization::view_release_notes[language]));
+  strings.set_download(Text(localization::manual_download[language]));
+  strings.set_install_update(Text(localization::install_update[language]));
+  strings.set_retry_update(Text(localization::retry_update[language]));
+  strings.set_install_update_confirm(
+      Text(localization::install_update_confirm[language]));
+  strings.set_input_password(Text(localization::input_password[language]));
+  strings.set_reinput_password(Text(localization::reinput_password[language]));
+  strings.set_remember_password(
+      Text(localization::remember_password[language]));
+  strings.set_validate_password(
+      Text(localization::validate_password[language]));
+  strings.set_request_permissions(
+      Text(localization::request_permissions[language]));
+  strings.set_permission_required(
+      Text(localization::permission_required_message[language]));
+  strings.set_screen_recording_permission(
+      Text(localization::screen_recording_permission[language]));
+  strings.set_accessibility_permission(
+      Text(localization::accessibility_permission[language]));
+  strings.set_wayland_notice_title(
+      Text(localization::wayland_notice_title[language]));
+  strings.set_wayland_notice_subtitle(
+      Text(localization::wayland_notice_subtitle[language]));
+  strings.set_wayland_permission_title(
+      Text(localization::wayland_permission_title[language]));
+  strings.set_wayland_notice_message(
+      Text(localization::wayland_notice_message[language]));
+  strings.set_wayland_recommendation_title(
+      Text(localization::wayland_recommendation_title[language]));
+  strings.set_wayland_recommendation_message(
+      Text(localization::wayland_recommendation_message[language]));
+  strings.set_wayland_notice_acknowledge(
+      Text(localization::wayland_notice_acknowledge[language]));
+  strings.set_service_setup_title(
+      Text(localization::windows_service_setup_title[language]));
+  strings.set_service_setup_message(
+      Text(localization::windows_service_setup_message[language]));
+  strings.set_service_settings_label(
+      Text(localization::windows_service_settings_label[language]));
+  strings.set_install_service(
+      Text(localization::install_windows_service[language]));
+  strings.set_service_installed(
+      Text(localization::windows_service_installed[language]));
+  strings.set_repair_service(
+      Text(localization::repair_windows_service[language]));
+  strings.set_service_repair_title(
+      Text(localization::windows_service_repair_title[language]));
+  strings.set_service_repair_message(
+      Text(localization::windows_service_repair_message[language]));
+  strings.set_do_not_remind(
+      Text(localization::do_not_remind_again[language]));
+  strings.set_notification(Text(localization::notification[language]));
+  strings.set_service_suppressed_message(
+      Text(localization::windows_service_prompt_suppressed_message[language]));
+  strings.set_codec_h264(Text(localization::h264[language]));
+  strings.set_codec_av1(Text(localization::av1[language]));
+  strings.set_self_hosted_settings(
+      Text(localization::self_hosted_server_settings[language]));
+  strings.set_access_website(Text(localization::access_website[language]));
+  strings.set_release_date_label(Text(localization::release_date[language]));
+  strings.set_later(Text(localization::cancel[language]));
+  return language;
+}
+
+template <typename Window>
+inline int ApplyStreamWindowStrings(
+    const slint::ComponentHandle<Window>& window, int language_index) {
+  const int language =
+      localization::detail::ClampLanguageIndex(language_index);
+  auto& strings = window->template global<ui::StreamStrings>();
+  strings.set_window_minimize(Text(localization::window_minimize[language]));
+  strings.set_window_maximize(Text(localization::window_maximize[language]));
+  strings.set_window_restore(Text(localization::window_restore[language]));
+  strings.set_window_close(Text(localization::window_close[language]));
+  strings.set_remote_update_title(Text(localization::remote_update_title[language]));
+  strings.set_remote_update(Text(localization::remote_update[language]));
+  strings.set_remote_update_dismiss(Text(localization::remote_update_dismiss[language]));
+  strings.set_select_display(Text(localization::select_display[language]));
+  strings.set_send_shortcut(Text(localization::send_shortcut[language]));
+  strings.set_privacy_unlocked_title(Text(localization::privacy_unlocked_title[language]));
+  strings.set_privacy_unlocked_message(Text(localization::privacy_unlocked_message[language]));
+  strings.set_privacy_unlock_confirm(Text(localization::privacy_unlock_confirm[language]));
+  strings.set_privacy_unlock_lock(Text(localization::privacy_unlock_lock[language]));
+  strings.set_privacy_enable(Text(localization::privacy_enable[language]));
+  strings.set_privacy_disable(Text(localization::privacy_disable[language]));
+  strings.set_control_mouse(Text(localization::control_mouse[language]));
+  strings.set_release_mouse(Text(localization::release_mouse[language]));
+  strings.set_settings(Text(localization::settings[language]));
+  strings.set_mouse_sensitivity(Text(localization::mouse_sensitivity[language]));
+  strings.set_wheel_sensitivity(Text(localization::wheel_sensitivity[language]));
+  strings.set_video_settings_unavailable(
+      Text(localization::video_settings_unavailable[language]));
+  strings.set_video_quality(Text(localization::video_quality[language]));
+  strings.set_frame_rate(Text(localization::video_frame_rate[language]));
+  strings.set_remote_resolution(Text(localization::resolution[language]));
+  strings.set_adaptation_policy(
+      Text(localization::video_adaptation_policy[language]));
+  strings.set_quality_low(Text(localization::video_quality_low[language]));
+  strings.set_quality_medium(
+      Text(localization::video_quality_medium[language]));
+  strings.set_quality_high(Text(localization::video_quality_high[language]));
+  strings.set_priority_frame_rate(
+      Text(localization::video_priority_frame_rate[language]));
+  strings.set_priority_quality(
+      Text(localization::video_priority_quality[language]));
+  strings.set_priority_balanced(
+      Text(localization::video_priority_balanced[language]));
+  strings.set_audio(Text(localization::audio_capture[language]));
+  strings.set_mute(Text(localization::mute[language]));
+  strings.set_select_file(Text(localization::select_file[language]));
+  strings.set_show_stats(
+      Text(localization::show_net_traffic_stats[language]));
+  strings.set_hide_stats(
+      Text(localization::hide_net_traffic_stats[language]));
+  strings.set_fullscreen(Text(localization::fullscreen[language]));
+  strings.set_exit_fullscreen(Text(localization::exit_fullscreen[language]));
+  strings.set_disconnect(Text(localization::disconnect[language]));
+  strings.set_confirm_disconnect(
+      Text(localization::stream_confirm_disconnect[language]));
+  strings.set_disconnect_description(
+      Text(localization::stream_disconnect_description[language]));
+  strings.set_cancel(Text(localization::cancel[language]));
+  strings.set_file_transfer(
+      Text(localization::file_transfer_progress[language]));
+  strings.set_expand_control(Text(localization::expand_control_bar[language]));
+  strings.set_collapse_control(
+      Text(localization::collapse_control_bar[language]));
+  strings.set_stats_in(Text(localization::in[language]));
+  strings.set_stats_out(Text(localization::out[language]));
+  strings.set_stats_loss_rate(Text(localization::loss_rate[language]));
+  strings.set_stats_resolution(Text(localization::resolution[language]));
+  strings.set_stats_video_latency(Text(localization::video_latency[language]));
+  strings.set_stats_connection_latency(Text(localization::connection_latency[language]));
+  strings.set_stats_connection_mode(
+      Text(localization::connection_mode[language]));
+  strings.set_stats_local_endpoint(Text(localization::Literal("本端地址", language)));
+  strings.set_stats_remote_endpoint(Text(localization::Literal("对端地址", language)));
+  strings.set_stats_encoder(Text(localization::remote_video_encoder[language]));
+  strings.set_stats_decoder(Text(localization::local_video_decoder[language]));
+  strings.set_stats_encryption(
+      Text(localization::transport_encryption[language]));
+  strings.set_stats_encryption_enabled(
+      Text(localization::transport_encryption_enabled[language]));
+  strings.set_stats_encryption_disabled(
+      Text(localization::transport_encryption_disabled[language]));
+  return language;
+}
+
+}  // namespace crossdesk::ui_localization
+
+
+#endif

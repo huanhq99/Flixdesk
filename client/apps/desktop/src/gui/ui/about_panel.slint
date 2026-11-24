@@ -1,0 +1,250 @@
+import { SurfaceSeparator, FlatSurface, UiSurface } from "ui_surface.slint";
+import { ScrollView, TextEdit } from "std-widgets.slint";
+import { SettingsDialog, SettingsButton } from "settings_controls.slint";
+import { WorkbenchStyle } from "workbench_controls.slint";
+import { UiRadius } from "ui_radius.slint";
+import { GalleryStrings } from "device_strings.slint";
+import { FontAwesomeIcons, ControlStyle } from "common.slint";
+import "../assets/fonts/message_spacing.ttf";
+
+export enum AboutPage { overview, components, component, document, source }
+export struct AboutDocument { title: string, text: string }
+export struct AboutComponent {
+    id: string,
+    name: string,
+    version: string,
+    license: string,
+    source-url: string,
+    documents: [AboutDocument],
+}
+
+export global AboutStrings {
+    out property <string> software-license: GalleryStrings.texts[130];
+    out property <string> components: GalleryStrings.texts[131];
+    out property <string> source: GalleryStrings.texts[132];
+    out property <string> notices: GalleryStrings.texts[133];
+    out property <string> view-source: GalleryStrings.texts[134];
+    out property <string> back: GalleryStrings.texts[135];
+    out property <string> special-sponsor: GalleryStrings.texts[212];
+}
+
+export component AboutNavigationGroup inherits FlatSurface {
+    height: rows.preferred-height + 2px;
+    background: WorkbenchStyle.surface;
+    border-radius: UiRadius.control;
+    outline-color: UiSurface.edge;
+    clip: true;
+    rows := VerticalLayout {
+        x: 1px; y: 1px; width: parent.width - 2px;
+        height: self.preferred-height; padding: 0px; spacing: 0px;
+        @children
+    }
+}
+
+export component AboutRowSeparator inherits Rectangle {
+    height: 1px;
+    SurfaceSeparator {
+        x: 14px; width: parent.width - 30px; height: 1px;
+        outline-color: UiSurface.separator;
+    }
+}
+
+export component AboutNavigationRow inherits FlatSurface {
+    in property <string> title;
+    in property <string> subtitle;
+    in property <string> icon;
+    in property <image> logo;
+    private property <bool> has-logo: root.logo.width > 0;
+    in property <string> detail;
+    in property <bool> grouped: false;
+    in property <bool> external: false;
+    in property <bool> enabled: true;
+    callback clicked;
+    out property <length> content-width: labels.x + labels.preferred-width + 36px
+        + (root.detail != "" ? detail-label.width + 12px : 0px);
+    min-width: 0px;
+    min-height: max(root.has-logo ? 56px : 44px, labels.preferred-height + 20px);
+    background: touch.pressed ? WorkbenchStyle.pressed-surface
+        : touch.has-hover ? WorkbenchStyle.hover-surface : WorkbenchStyle.surface;
+    border-radius: root.grouped ? 0px : UiRadius.control;
+    outline-enabled: !root.grouped; outline-color: UiSurface.edge;
+    opacity: root.enabled ? 1 : 0.45;
+    accessible-role: button;
+    accessible-label: root.title + (root.subtitle != "" ? ", " + root.subtitle : "")
+        + (root.detail != "" ? ", " + root.detail : "");
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+    if root.has-logo: Image {
+        x: 12px; y: (parent.height - self.height) / 2;
+        width: 44px; height: 44px;
+        source: root.logo; image-fit: contain;
+        accessible-role: none;
+    }
+    if !root.has-logo && root.icon != "": Rectangle {
+        x: 12px; y: (parent.height - self.height) / 2;
+        width: 28px; height: 28px;
+        border-radius: UiRadius.control;
+        background: ControlStyle.surface;
+        Text {
+            text: root.icon; font-family: "Font Awesome 6 Free"; font-weight: 900;
+            font-size: 13px; color: ControlStyle.icon;
+            horizontal-alignment: center; vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    labels := VerticalLayout {
+        x: root.has-logo ? 68px : root.icon != "" ? 52px : 14px;
+        y: (parent.height - self.height) / 2;
+        width: parent.width - self.x - 36px - (root.detail != "" ? detail-label.width + 12px : 0px);
+        height: self.preferred-height; spacing: 4px;
+        Text { text: root.title; color: WorkbenchStyle.text; font-size: 13px; wrap: word-wrap; }
+        if root.subtitle != "": Text {
+            text: root.subtitle; color: WorkbenchStyle.muted; font-size: 11px; wrap: word-wrap;
+        }
+    }
+    detail-label := Text {
+        x: parent.width - self.width - 36px; height: parent.height;
+        width: min(100px, self.preferred-width);
+        text: root.detail; color: WorkbenchStyle.muted; font-size: 11px;
+        vertical-alignment: center; overflow: elide;
+        accessible-role: none;
+    }
+    Text {
+        x: parent.width - 30px; width: 18px; height: parent.height;
+        text: root.external ? FontAwesomeIcons.arrow-up-right-from-square : FontAwesomeIcons.angle-right;
+        font-family: "Font Awesome 6 Free"; font-weight: 900;
+        color: touch.has-hover ? WorkbenchStyle.accent : WorkbenchStyle.muted;
+        font-size: 11px; vertical-alignment: center; horizontal-alignment: center;
+        accessible-role: none;
+    }
+    touch := TouchArea { enabled: root.enabled; mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export component AboutPanel inherits SettingsDialog {
+    show-close-button: false;
+    in-out property <AboutPage> page: AboutPage.components;
+    in-out property <int> component-index: 0;
+    private property <int> document-index: 0;
+    in property <[AboutComponent]> components;
+    in property <int> openfec-index: -1;
+    in property <string> revision;
+    in property <string> source-url;
+    in property <string> build-url;
+    private property <AboutComponent> selected: root.components[root.component-index];
+    callback back;
+    callback open-link(string);
+    title: root.page == AboutPage.components ? AboutStrings.components
+        : root.page == AboutPage.source ? AboutStrings.source
+        : root.page == AboutPage.document ? AboutStrings.notices
+        : root.selected.name;
+
+    if root.page != AboutPage.document: ScrollView {
+        x: 24px; y: root.content-top; width: parent.width - 48px + 22px;
+        height: footer.y - self.y - 16px;
+        viewport-width: self.visible-width;
+        viewport-height: content.preferred-height;
+        horizontal-scrollbar-policy: always-off;
+        vertical-scrollbar-policy: as-needed;
+        content := VerticalLayout {
+            width: parent.width; height: self.preferred-height;
+            padding: 0px; padding-right: 22px; spacing: 10px;
+            if root.page == AboutPage.components: VerticalLayout {
+                padding: 0px; spacing: 10px;
+                Text {
+                    text: GalleryStrings.texts[136];
+                    color: WorkbenchStyle.muted; font-size: 12px; wrap: word-wrap;
+                }
+                Rectangle {
+                    height: notice.preferred-height + 32px;
+                    background: WorkbenchStyle.field-surface; border-radius: UiRadius.control;
+                    notice := VerticalLayout {
+                        x: 16px; y: 16px; width: parent.width - 32px;
+                        height: self.preferred-height; spacing: 12px;
+                        Text { text: GalleryStrings.texts[137]; color: WorkbenchStyle.text; font-size: 14px; font-weight: 600; }
+                        Text {
+                            text: GalleryStrings.texts[138];
+                            color: WorkbenchStyle.muted; font-size: 13px; wrap: word-wrap;
+                            font-family: "CrossDesk Message Spacing";
+                        }
+                        Text {
+                            text: "(c) Copyright 2009 - 2012 INRIA - All rights reserved";
+                            color: WorkbenchStyle.muted; font-size: 11px; wrap: word-wrap;
+                            font-family: "CrossDesk Message Spacing";
+                        }
+                        if root.openfec-index >= 0: AboutNavigationRow {
+                            title: GalleryStrings.texts[139];
+                            clicked => { root.component-index = root.openfec-index; root.page = AboutPage.component; }
+                        }
+                    }
+                }
+                for component[index] in root.components: VerticalLayout {
+                    padding: 0px; spacing: 0px;
+                    if component.id != "crossdesk" && component.id != "openfec": AboutNavigationRow {
+                        title: component.name;
+                        subtitle: component.version + " · " + component.license;
+                        clicked => { root.component-index = index; root.page = AboutPage.component; }
+                    }
+                }
+            }
+            if root.page == AboutPage.component: VerticalLayout {
+                padding: 0px; spacing: 12px;
+                Text { text: root.selected.version + " · " + root.selected.license; color: WorkbenchStyle.muted; font-size: 12px; wrap: word-wrap; }
+                AboutNavigationRow {
+                    title: AboutStrings.view-source; external: true;
+                    clicked => { root.open-link(root.selected.source-url); }
+                }
+                Text { text: AboutStrings.notices; color: WorkbenchStyle.text; font-size: 13px; font-weight: 600; }
+                for document[index] in root.selected.documents: AboutNavigationRow {
+                    title: document.title;
+                    clicked => { root.document-index = index; root.page = AboutPage.document; }
+                }
+                if root.selected.documents.length == 0: Text {
+                    text: GalleryStrings.texts[140];
+                    color: WorkbenchStyle.muted; font-size: 12px; wrap: word-wrap;
+                }
+            }
+            if root.page == AboutPage.source: VerticalLayout {
+                padding: 0px; spacing: 12px;
+                Text {
+                    text: root.revision != "" ? GalleryStrings.texts[141] + root.revision
+                        : GalleryStrings.texts[142];
+                    color: WorkbenchStyle.text; font-size: 13px; wrap: word-wrap;
+                }
+                AboutNavigationRow { title: AboutStrings.view-source; external: true; clicked => { root.open-link(root.source-url); } }
+                AboutNavigationRow {
+                    title: GalleryStrings.texts[143]; external: true;
+                    clicked => { root.open-link(root.build-url); }
+                }
+                AboutNavigationRow {
+                    title: GalleryStrings.texts[144]; external: true;
+                    clicked => { root.open-link("https://crossdesk.cn"); }
+                }
+            }
+        }
+    }
+    if root.page == AboutPage.document: VerticalLayout {
+        x: 24px; y: root.content-top; width: parent.width - 48px;
+        height: footer.y - self.y - 16px; spacing: 12px;
+        Text { text: root.selected.documents[root.document-index].title; color: WorkbenchStyle.text; font-size: 13px; font-weight: 600; wrap: word-wrap; }
+        TextEdit {
+            text: root.selected.documents[root.document-index].text;
+            read-only: true; wrap: word-wrap; font-size: 14px;
+            // Use the same 1.5em line spacing as other long-form reading views.
+            font-family: "CrossDesk Message Spacing";
+            vertical-stretch: 1;
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.back(); return accept; }
+                return reject;
+            }
+        }
+    }
+    footer := VerticalLayout {
+        x: 24px; y: parent.height - self.height - 24px;
+        width: parent.width - 48px; height: self.preferred-height; spacing: 12px;
+        SurfaceSeparator { height: 1px; outline-color: UiSurface.separator; }
+        HorizontalLayout {
+            alignment: end;
+            SettingsButton { text: AboutStrings.back; clicked => { root.back(); } }
+        }
+    }
+}

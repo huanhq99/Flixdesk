@@ -1,0 +1,288 @@
+import { SurfaceSeparator, FlatSurface, UiSurface } from "ui_surface.slint";
+import { UiRadius } from "ui_radius.slint";
+import { GalleryStrings } from "device_strings.slint";
+import { EndpointPopup } from "detail_popup.slint";
+import { CompactButton, ScrollingText, HoverTooltip } from "common.slint";
+import { ScrollView } from "std-widgets.slint";
+
+export struct GalleryNetworkDevice {
+    name: string,
+    id: string,
+    mode: string,
+    encryption-known: bool,
+    encryption-enabled: bool,
+    video-latency: string,
+    inbound: string,
+    outbound: string,
+    loss: string,
+    resolution: string,
+    fps: string,
+    encoder: string,
+    decoder: string,
+    local-endpoint: string,
+    remote-endpoint: string,
+}
+
+component NetworkRow inherits Rectangle {
+    in property <GalleryNetworkDevice> device;
+    in property <bool> heading: false;
+    out property <bool> mode-hovered: mode-hover.has-hover;
+    out property <length> mode-center-x: mode-badge.absolute-position.x - root.absolute-position.x + mode-badge.width / 2;
+    // Keep the same column geometry in the header and every row. Grouping
+    // related values leaves room for device names even in the 640px window.
+    HorizontalLayout {
+        x: 0px; y: 0px; width: parent.width; height: parent.height;
+        padding-left: 12px; padding-right: 12px; spacing: 10px;
+        identity := Rectangle {
+            horizontal-stretch: 1;
+            device-name := Text {
+                y: root.heading ? 0px : 8px; height: root.heading ? parent.height : 20px;
+                width: parent.width; text: root.device.name;
+                font-size: root.heading ? 11px : 12px; font-weight: 600;
+                color: root.heading ? #6b7785 : #293746;
+                vertical-alignment: center; overflow: elide;
+            }
+            name-hover := TouchArea {
+                y: 8px; height: 20px; width: parent.width;
+                enabled: !root.heading;
+            }
+            HorizontalLayout {
+                visible: !root.heading;
+                x: 0px; y: 30px; width: parent.width; height: 17px; spacing: 4px;
+                id-text := Text {
+                    text: root.device.id; font-size: 10px; color: #7a8490;
+                    min-width: 0px;
+                    max-width: max(0px, parent.width - mode-badge.width - encryption-badge.width - 12px);
+                    vertical-alignment: center; overflow: elide;
+                }
+                mode-badge := Rectangle {
+                    width: min(mode-text.preferred-width + 12px,
+                        max(0px, parent.width - encryption-badge.width - 8px));
+                    background: #edf2f7; border-radius: 3px;
+                    mode-text := Text {
+                        x: 6px; width: parent.width - 12px; height: parent.height;
+                        text: root.device.mode; font-size: 10px; color: #586f87;
+                        horizontal-alignment: center; vertical-alignment: center; overflow: elide;
+                    }
+                    mode-hover := TouchArea {
+                        enabled: !root.heading && root.device.local-endpoint != "" && root.device.remote-endpoint != "";
+                        mouse-cursor: default;
+                    }
+                }
+                encryption-badge := Rectangle {
+                    width: encryption-text.preferred-width + 12px;
+                    background: !root.device.encryption-known ? #f0f2f5
+                        : root.device.encryption-enabled ? #e8f5ec : #fff3df;
+                    border-radius: 3px;
+                    encryption-text := Text {
+                        x: 6px; width: parent.width - 12px; height: parent.height;
+                        text: !root.device.encryption-known
+                            ? GalleryStrings.texts[38]
+                            : root.device.encryption-enabled
+                                ? GalleryStrings.texts[39]
+                                : GalleryStrings.texts[40];
+                        color: !root.device.encryption-known ? #7a8490
+                            : root.device.encryption-enabled ? #18794e : #8a6428;
+                        font-size: 10px; horizontal-alignment: center;
+                        vertical-alignment: center; overflow: elide;
+                    }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+        }
+        Rectangle {
+            width: max(108px, root.width * 0.19);
+            Text {
+                y: root.heading ? 0px : 8px; height: root.heading ? parent.height : 20px;
+                width: parent.width;
+                text: root.heading ? GalleryStrings.texts[41] : root.device.resolution;
+                font-size: root.heading ? 11px : 12px; font-weight: root.heading ? 600 : 400;
+                color: root.heading ? #6b7785 : #293746;
+                vertical-alignment: center; overflow: elide;
+            }
+            if !root.heading: Text {
+                y: 30px; height: 17px; width: parent.width;
+                text: root.device.fps; font-size: 11px; color: #7a8490;
+                vertical-alignment: center; overflow: elide;
+            }
+        }
+        Rectangle {
+            width: max(100px, root.width * 0.18);
+            if root.heading: Text {
+                x: 0px; width: parent.width;
+                text: GalleryStrings.texts[42];
+                font-size: 11px; font-weight: 600; color: #6b7785;
+                vertical-alignment: center; overflow: elide;
+            }
+            if !root.heading: Text {
+                x: 0px; y: 8px; height: 20px; width: 14px;
+                text: "↓"; color: #2676b9; font-size: 12px; vertical-alignment: center;
+            }
+            if !root.heading: Text {
+                x: 17px; y: 8px; height: 20px; width: parent.width - 17px;
+                text: root.device.inbound; color: #293746; font-size: 12px;
+                vertical-alignment: center; overflow: elide;
+            }
+            if !root.heading: Text {
+                x: 0px; y: 30px; height: 17px; width: 14px;
+                text: "↑"; color: #7a8490; font-size: 11px; vertical-alignment: center;
+            }
+            if !root.heading: Text {
+                x: 17px; y: 30px; height: 17px; width: parent.width - 17px;
+                text: root.device.outbound; color: #7a8490; font-size: 11px;
+                vertical-alignment: center; overflow: elide;
+            }
+        }
+        Rectangle {
+            width: max(94px, root.width * 0.16);
+            Text {
+                y: root.heading ? 0px : 8px; height: root.heading ? parent.height : 20px;
+                width: parent.width;
+                text: root.heading ? GalleryStrings.texts[43] : root.device.video-latency;
+                font-size: root.heading ? 11px : 12px; font-weight: root.heading ? 600 : 400;
+                color: root.heading ? #6b7785 : #293746;
+                vertical-alignment: center; overflow: elide;
+            }
+            if !root.heading: Text {
+                y: 30px; height: 17px; width: parent.width;
+                text: GalleryStrings.texts[44] + root.device.loss;
+                font-size: 11px; color: #7a8490;
+                vertical-alignment: center; overflow: elide;
+            }
+        }
+    }
+    if !root.heading && name-hover.has-hover && device-name.preferred-width > identity.width: HoverTooltip {
+        x: 12px; y: 32px; z: 10;
+        available-width: root.width - 24px;
+        text: root.device.name; wrap: no-wrap;
+    }
+    if !root.heading: HorizontalLayout {
+        x: 12px; y: 52px; width: parent.width - 24px; height: 20px;
+        spacing: 12px;
+        Rectangle {
+            width: (parent.width - 12px) / 2;
+            encoder-label := Text {
+                height: parent.height; width: self.preferred-width;
+                text: GalleryStrings.texts[45];
+                font-size: 10px; color: #586f87; vertical-alignment: center;
+            }
+            ScrollingText {
+                x: encoder-label.width; width: max(0px, parent.width - self.x); height: parent.height;
+                text: root.device.encoder; font-size: 10px; text-color: #586f87;
+            }
+        }
+        Rectangle {
+            width: (parent.width - 12px) / 2;
+            decoder-label := Text {
+                height: parent.height; width: self.preferred-width;
+                text: GalleryStrings.texts[46];
+                font-size: 10px; color: #586f87; vertical-alignment: center;
+            }
+            ScrollingText {
+                x: decoder-label.width; width: max(0px, parent.width - self.x); height: parent.height;
+                text: root.device.decoder; font-size: 10px; text-color: #586f87;
+            }
+        }
+    }
+
+}
+
+component NetworkEmptyState inherits Rectangle {
+    VerticalLayout {
+        alignment: center; spacing: 8px;
+        Text {
+            text: GalleryStrings.texts[47];
+            font-size: 13px; color: #596878; horizontal-alignment: center;
+        }
+        Text {
+            text: GalleryStrings.texts[48];
+            font-size: 11px; color: #8a95a1; horizontal-alignment: center;
+        }
+    }
+}
+
+export component GalleryNetworkDialog inherits Rectangle {
+    in property <[GalleryNetworkDevice]> devices;
+    private property <length> row-height: 78px;
+    private property <length> list-height: max(2, min(root.devices.length, 6)) * root.row-height;
+    private property <int> hovered-index: -1;
+    private property <length> hovered-badge-x;
+    callback close();
+    background: #00000042;
+    TouchArea { clicked => { root.close(); } }
+    FlatSurface {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: min(760px, parent.width - 32px);
+        height: min(120px + root.list-height, parent.height - 32px);
+        background: white; border-radius: UiRadius.surface;
+        outline-color: UiSurface.edge;
+        TouchArea {}
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if event.text == Key.Escape { root.close(); }
+                accept
+            }
+        }
+        Text {
+            x: 20px; y: 17px; width: parent.width - 120px; height: 24px;
+            text: GalleryStrings.texts[49];
+            font-size: 17px; font-weight: 600; color: #293746;
+        }
+        CompactButton {
+            border-radius: UiRadius.control;
+            x: parent.width - 80px; y: 17px; width: 60px; height: 26px;
+            text: GalleryStrings.texts[50]; clicked => { root.close(); }
+        }
+        Text {
+            x: 20px; y: 48px; width: parent.width - 40px; height: 18px;
+            text: GalleryStrings.texts[51] + root.devices.length
+                + GalleryStrings.texts[52];
+            font-size: 11px; color: #7a8490; overflow: elide;
+        }
+        NetworkRow {
+            x: 12px; y: 78px; width: parent.width - 38px; height: 30px;
+            heading: true; background: #f3f5f8; border-radius: UiRadius.control;
+            device: {
+                name: GalleryStrings.texts[53],
+            };
+        }
+        list := ScrollView {
+            x: 12px; y: 108px; width: parent.width - 24px;
+            height: parent.height - self.y - 12px;
+            viewport-width: self.width - 14px;
+            viewport-height: max(self.height, root.devices.length * root.row-height);
+            horizontal-scrollbar-policy: always-off;
+            changed viewport-y => { root.hovered-index = -1; }
+            for device[index] in root.devices: NetworkRow {
+                y: index * root.row-height; width: list.viewport-width; height: root.row-height;
+                changed mode-hovered => {
+                    if self.mode-hovered {
+                        root.hovered-index = index;
+                        root.hovered-badge-x = self.mode-center-x;
+                    } else if root.hovered-index == index {
+                        root.hovered-index = -1;
+                    }
+                }
+                device: device; background: mod(index, 2) == 0 ? white : #f8fafc;
+                SurfaceSeparator { y: parent.height - 1px; height: 1px; outline-color: UiSurface.separator; }
+            }
+        }
+        if root.hovered-index >= 0 && root.hovered-index < root.devices.length
+            && root.devices[root.hovered-index].local-endpoint != ""
+            && root.devices[root.hovered-index].remote-endpoint != "": EndpointPopup {
+            available-width: parent.width - 16px;
+            x: clamp(list.x + root.hovered-badge-x - self.width / 2, 8px, parent.width - self.width - 8px);
+            private property <length> badge-y: list.y + list.viewport-y + root.hovered-index * root.row-height + 30px;
+            y: self.badge-y - self.height - 4px;
+            local-label: GalleryStrings.texts[213];
+            local-address: root.devices[root.hovered-index].local-endpoint;
+            remote-label: GalleryStrings.texts[214];
+            remote-address: root.devices[root.hovered-index].remote-endpoint;
+        }
+        if root.devices.length == 0: NetworkEmptyState {
+            x: list.x; y: list.y; width: list.width; height: list.height;
+        }
+    }
+}

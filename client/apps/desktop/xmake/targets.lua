@@ -1,0 +1,842 @@
+function setup_targets()
+    local crossdesk_version = get_config("CROSSDESK_VERSION") or "0.0.0"
+    local version_define = "CROSSDESK_VERSION=\"" .. crossdesk_version .. "\""
+    local windows_resource_defines = {
+        "CROSSDESK_VERSION_STRING=\"" .. crossdesk_version .. "\""
+    }
+    local version_base = crossdesk_version:gsub("^v", ""):match("^(%d[%d%.]*)") or "0.0.0"
+    local version_parts = {}
+    for part in version_base:gmatch("%d+") do
+        local value = tonumber(part) or 0
+        table.insert(version_parts, value <= 65535 and value or 0)
+        if #version_parts == 4 then
+            break
+        end
+    end
+    while #version_parts < 4 do
+        table.insert(version_parts, 0)
+    end
+    table.insert(windows_resource_defines,
+        "CROSSDESK_VERSION_NUMERIC=" .. table.concat(version_parts, ","))
+
+    local function copy_slint_runtime(target)
+        if not target:is_plat("windows", "linux") and
+            not (target:is_plat("macosx") and target:name() == "crossdesk") then
+            return
+        end
+
+        local slint = target:pkg("slint")
+        if not slint and target:dep("gui") then
+            slint = target:dep("gui"):pkg("slint")
+        end
+        assert(slint, "the Slint package is required to copy its runtime")
+        local runtime_dir = path.join(slint:installdir(), "lib")
+        if target:is_plat("linux", "macosx") then
+            -- Same-version Slint builds can contain different platform fixes.
+            local library = target:is_plat("macosx") and "libslint_cpp.dylib" or "libslint_cpp.so"
+            local runtime = path.join(runtime_dir, library)
+            assert(os.isfile(runtime), "Slint runtime not found: " .. runtime)
+            os.cp(runtime, target:targetdir())
+            return
+        end
+        local runtime_dll = path.join(runtime_dir, "slint_cpp.dll")
+        assert(os.isfile(runtime_dll), "Slint runtime not found: " .. runtime_dll)
+        import("utils.binary.deplibs")
+        local dependencies = deplibs(runtime_dll, {plat = "windows", arch = target:arch()})
+        assert(dependencies and #dependencies > 0, "Cannot inspect Slint runtime dependencies: " .. runtime_dll)
+        for _, dependency in ipairs(dependencies) do
+            local name = path.filename(dependency):lower()
+            assert(not (name:match("^vcruntime%d.*%.dll$") or name:match("^msvcp%d.*%.dll$") or
+                name:match("^msvcr%d.*%.dll$") or name:match("^concrt%d.*%.dll$")),
+                "Slint runtime depends on " .. dependency .. "; rebuild the Slint package with static CRT")
+        end
+        os.cp(runtime_dll, target:targetdir())
+    end
+
+    -- Keep runtime deployment independent of each target's after_build callback.
+    rule("crossdesk.slint_runtime")
+        after_build(copy_slint_runtime)
+    rule_end()
+
+    -- Amyuni usbmmidd_v2 virtual display driver for headless Windows hosts.
+    -- The installer and the portable archive pick it up from the target
+    -- directory; the runtime looks for it next to the executables.
+    local function copy_usbmmidd_package(target)
+        if not target:is_plat("windows") then
+            return
+        end
+        local source = path.join(os.projectdir(), "apps/desktop/resources/windows/usbmmidd_v2")
+        assert(os.isfile(path.join(source, "deviceinstaller64.exe")),
+            "usbmmidd_v2 driver package not found: " .. source)
+        local destination = path.join(target:targetdir(), "usbmmidd_v2")
+        os.tryrm(destination)
+        os.cp(source, destination)
+    end
+
+    local crossdesk_windows_resource = "apps/desktop/resources/windows/crossdesk.rc"
+    if is_config("CROSSDESK_PORTABLE", true) then
+        crossdesk_windows_resource = "apps/desktop/resources/windows/crossdesk_portable.rc"
+    end
+
+    target("rd_log")
+        set_kind("object")
+        add_rules("crossdesk.build_identity")
+        add_packages("spdlog", {public = true})
+        add_files("apps/desktop/src/log/rd_log.cpp")
+        add_includedirs("apps/desktop/src/log", {public = true})
+
+    -- MiniRTC owns a target named "common". Reusing it merges the two targets
+    -- and makes the media library inherit desktop sources and dependencies.
+    target("private_file")
+        set_kind("static")
+        add_files("apps/desktop/src/common/private_file.cpp")
+        add_includedirs("apps/desktop/src/common", {public = true})
+        add_packages("openssl3", {public = true})
+        if is_os("windows") then
+            add_syslinks("Advapi32", {public = true})
+        end
+
+    target("desktop_common")
+        set_kind("object")
+        add_deps("rd_log", "crossdesk_wire")
+        add_packages("libyuv", "openssl3")
+        add_packages("concurrentqueue")
+        add_files("apps/desktop/src/common/*.cpp")
+        remove_files("apps/desktop/src/common/private_file.cpp")
+        add_deps("private_file")
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/system_info.cpp",
+                "apps/desktop/src/platform/windows/screen_lock.cpp",
+                "apps/desktop/src/platform/windows/desktop_automation.cpp")
+            add_syslinks("Advapi32", "Wtsapi32", "Ole32", "OleAut32", "Uiautomationcore", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/system_info.cpp",
+                "apps/desktop/src/platform/macos/screen_lock.cpp",
+                "apps/desktop/src/platform/macos/desktop_automation.mm")
+            add_frameworks("AppKit", "ApplicationServices", {public = true})
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/system_info.cpp",
+                "apps/desktop/src/platform/linux/screen_lock.cpp",
+                "apps/desktop/src/platform/linux/desktop_automation.cpp",
+                "apps/desktop/src/platform/linux/common/*.cpp")
+            add_includedirs("apps/desktop/src/platform/linux/common")
+            add_syslinks("Xi", "xcb", {public = true})
+            add_packages("atspi", {public = true})
+            on_load(function (target)
+                if target:pkg("atspi") then target:add("defines", "CROSSDESK_HAS_ATSPI=1") end
+            end)
+        end
+        add_includedirs("apps/desktop/src/common", {public = true})
+
+    target("path_manager")
+        set_kind("object")
+        if is_config("CROSSDESK_PORTABLE", true) then
+            add_defines("CROSSDESK_PORTABLE=1")
+        end
+        add_deps("rd_log")
+        add_files("apps/desktop/src/path_manager/*.cpp")
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/path_backend.cpp")
+            add_syslinks("Shell32", "Ole32", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/path_backend.cpp")
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/path_backend.cpp")
+        end
+        add_includedirs("apps/desktop/src", {public = true})
+        add_includedirs("apps/desktop/src/path_manager", {public = true})
+
+    target("path_manager_portable_test")
+        set_kind("binary")
+        set_default(false)
+        set_policy("build.ccache", false)
+        add_defines("CROSSDESK_PORTABLE=1")
+        add_includedirs("apps/desktop/src", "apps/desktop/src/path_manager")
+        add_files("apps/desktop/tests/path_manager_portable_test.cpp",
+            "apps/desktop/src/path_manager/path_manager.cpp")
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/path_backend.cpp")
+            add_syslinks("Shell32", "Ole32")
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/path_backend.cpp")
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/path_backend.cpp")
+        end
+
+    target("macos_keyboard_modifier_state_test")
+        set_kind("binary")
+        set_default(false)
+        add_includedirs("apps/desktop/src/platform/macos/input")
+        add_files("apps/desktop/tests/macos_keyboard_modifier_state_test.cpp")
+
+    target("cursor_position_test")
+        set_kind("binary")
+        set_default(false)
+        add_deps("crossdesk_wire")
+        add_includedirs("apps/desktop/src/common",
+            "apps/desktop/src/gui/runtime")
+        add_files("apps/desktop/tests/cursor_position_test.cpp")
+
+    target("single_instance")
+        set_kind("object")
+        add_includedirs("apps/desktop/src", {public = true})
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/single_instance.cpp")
+            add_files("apps/desktop/src/platform/windows/gui/instance_activation.cpp")
+            add_syslinks("Advapi32", "User32")
+        else
+            add_files("apps/desktop/src/platform/common/posix_single_instance.cpp")
+            add_files("apps/desktop/src/platform/common/posix_instance_activation.cpp")
+        end
+
+    target("repository_structure_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/repository_structure_test.cpp")
+
+    target("connection_status_protocol_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/connection_status_protocol_test.cpp")
+
+    target("video_callback_lifetime_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/video_callback_lifetime_test.cpp")
+
+    target("windows_manifest_resource_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/windows_manifest_resource_test.cpp")
+
+    target("windows_service_mouse_ipc_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/windows_service_mouse_ipc_test.cpp")
+
+    target("windows_unattended_policy_test")
+        set_kind("binary")
+        set_default(false)
+        add_includedirs("apps/desktop/src")
+        add_files("apps/desktop/tests/windows_unattended_policy_test.cpp")
+
+    target("windows_mouse_controller_safety_test")
+        set_kind("binary")
+        set_default(false)
+        add_files("apps/desktop/tests/windows_mouse_controller_safety_test.cpp")
+
+    if is_os("windows") then
+        target("windows_keyboard_capturer_test")
+            set_kind("binary")
+            set_default(false)
+            add_includedirs("apps/desktop/src/platform/windows/input",
+                "apps/desktop/src/platform/common/input",
+                "apps/desktop/src/device_controller", "apps/desktop/src/common",
+                "apps/desktop/src/log", "libs/wire/include")
+            add_files("apps/desktop/tests/windows_keyboard_capturer_test.cpp")
+            add_syslinks("user32")
+    end
+
+    target("windows_sas_guard_test")
+        set_kind("binary")
+        set_default(false)
+        add_includedirs("apps/desktop/src/platform/windows/service")
+        add_files("apps/desktop/tests/windows_sas_guard_test.cpp")
+
+    target("crossdesk_ui")
+        set_kind("static")
+        set_languages("c++20")
+        -- Generated bindings are not the video/rendering hot path. Optimizing
+        -- them for size avoids expensive inlining of the large UI object tree.
+        if is_mode("release") then
+            set_optimize("smallest")
+        end
+        add_packages("slint", {public = true})
+        add_rules("slint")
+        add_files("apps/desktop/src/gui/ui/crossdesk_ui.slint")
+        if is_os("windows") then
+            add_cxxflags("/bigobj")
+        end
+
+    target("slint_ui_smoke_test")
+        set_kind("binary")
+        set_languages("c++20")
+        set_default(false)
+        if is_os("windows") then
+            add_cxxflags("/bigobj")
+        end
+        add_packages("slint")
+        add_deps("crossdesk_ui")
+        add_includedirs("apps/desktop/src/gui", "apps/desktop/src/gui/assets/fonts",
+            "apps/desktop/src/gui/assets/localization")
+        add_files("apps/desktop/tests/slint_ui_smoke_test.cpp")
+        add_rules("crossdesk.slint_runtime")
+
+    if is_os("linux") then
+        target("linux_x11_capture_recovery_test")
+            set_kind("binary")
+            set_default(false)
+            add_packages("libyuv")
+            add_includedirs("apps/desktop/src/common", "apps/desktop/src/log",
+                "apps/desktop/src/screen_capturer", "apps/desktop/src/device_controller",
+                "apps/desktop/src/platform/linux/common", "libs/wire/include",
+                "deps/submodules/minirtc/src/api")
+            add_syslinks("X11", "Xrandr", "Xfixes", "Xtst", "pthread")
+            add_files("apps/desktop/tests/linux_x11_capture_recovery_test.cpp")
+    end
+
+    if is_os("linux") and is_arch("x86_64") and is_config("USE_CUDA", true) then
+        target("linux_cuda_graphics_test")
+            set_kind("binary")
+            set_default(false)
+            add_packages("spdlog")
+            add_includedirs("apps/desktop/src", "apps/desktop/src/log",
+                "deps/submodules/minirtc/src/api")
+            add_files("apps/desktop/tests/linux_cuda_graphics_test.cpp",
+                "apps/desktop/src/platform/linux/gui/cuda_graphics.cpp")
+    end
+
+    target("slint_stream_render_test")
+        set_kind("binary")
+        set_languages("c++20")
+        set_default(false)
+        if is_os("windows") then
+            add_cxxflags("/bigobj")
+        end
+        add_packages("slint")
+        add_deps("crossdesk_ui")
+        add_includedirs("apps/desktop/src/gui")
+        add_files("apps/desktop/tests/slint_stream_render_test.cpp")
+        add_rules("crossdesk.slint_runtime")
+
+    target("slint_popup_render_test")
+        set_kind("binary")
+        set_languages("c++20")
+        set_default(false)
+        if is_os("windows") then
+            add_cxxflags("/bigobj")
+        end
+        add_packages("slint")
+        add_deps("crossdesk_ui")
+        add_includedirs("apps/desktop/src/gui", "apps/desktop/src/gui/assets/localization")
+        add_files("apps/desktop/tests/slint_popup_render_test.cpp")
+        add_rules("crossdesk.slint_runtime")
+
+    target("version_checker_test")
+        set_kind("binary")
+        set_default(false)
+        add_packages("cpp-httplib", "nlohmann_json")
+        add_deps("rd_log", "crossdesk_wire", "updater_core")
+        add_includedirs("apps/desktop/src/version_checker")
+        add_files("apps/desktop/tests/version_checker_test.cpp",
+            "apps/desktop/src/version_checker/version_checker.cpp",
+            "apps/desktop/src/version_checker/linux_update_download.cpp")
+        if is_os("macosx") then
+            add_defines("CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN")
+            add_frameworks("Security", "CoreFoundation")
+        end
+
+    target("update_checker_test")
+        set_kind("binary")
+        set_default(false)
+        add_deps("version_checker")
+        add_files("apps/desktop/tests/update_checker_test.cpp")
+
+    target("privacy")
+        set_kind("object")
+        add_deps("rd_log", "crossdesk_wire")
+        add_files("apps/desktop/src/privacy/privacy_controller.cpp")
+        add_includedirs("apps/desktop/src/privacy", {public = true})
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/privacy/*.cpp")
+            add_deps("crossdesk_privacy_cursor_helper")
+            add_deps("crossdesk_privacy_window", {inherit = false})
+            add_includedirs("apps/desktop/src/platform/windows/input")
+            add_syslinks("Wtsapi32", "Ole32", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/privacy/*.mm")
+            add_mxxflags("-fobjc-arc")
+            add_frameworks("AppKit", "ApplicationServices", {public = true})
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/privacy/*.cpp")
+            add_syslinks("Xi", {public = true})
+        end
+
+    if is_os("windows") then
+        target("crossdesk_privacy_window")
+            set_kind("shared")
+            set_runtimes("MT")
+            add_files("apps/desktop/src/platform/windows/privacy/band_module/main.cpp")
+            add_files("apps/desktop/src/platform/windows/privacy/band_module/privacy_cover_renderer.cpp")
+            add_files("apps/desktop/resources/windows/crossdesk_privacy_window.rc",
+                {defines = windows_resource_defines})
+            add_syslinks("user32", "gdi32", "dwmapi")
+
+        target("crossdesk_privacy_cursor_helper")
+            set_kind("binary")
+            add_files("apps/desktop/src/platform/windows/privacy/cursor_helper/main.cpp")
+    end
+
+    target("screen_capturer")
+        set_kind("object")
+        add_deps("rd_log", "desktop_common", "crossdesk_wire")
+        add_includedirs("apps/desktop/src/screen_capturer", {public = true})
+        add_includedirs("deps/submodules/minirtc/src/api", {public = true})
+        if is_os("windows") then
+            add_deps("privacy")
+            add_packages("libyuv", "nlohmann_json")
+            add_files("apps/desktop/src/screen_capturer/captured_nv12_frame.cpp")
+            add_files("apps/desktop/src/platform/windows/screen_capturer/screen_capturer_dxgi.cpp",
+                "apps/desktop/src/platform/windows/screen_capturer/screen_capturer_gdi.cpp",
+                "apps/desktop/src/platform/windows/screen_capturer/screen_capturer_win.cpp",
+                "apps/desktop/src/platform/windows/screen_capturer/screen_capturer_factory.cpp")
+            add_files("apps/desktop/src/platform/windows/virtual_display/usbmmidd_virtual_display.cpp",
+                "apps/desktop/src/platform/windows/virtual_display/virtual_display_provisioner.cpp")
+            add_includedirs("apps/desktop/src/platform/windows",
+                "apps/desktop/src/platform/windows/screen_capturer",
+                "apps/desktop/src/platform/windows/service",
+                "apps/desktop/src/platform/windows/virtual_display")
+            add_syslinks("Setupapi", "RuntimeObject", {public = true})
+        elseif is_os("macosx") then
+            add_deps("privacy")
+            add_mxxflags("-fobjc-arc")
+            add_files("apps/desktop/src/platform/macos/screen_capturer/*.cpp",
+                "apps/desktop/src/platform/macos/screen_capturer/*.mm")
+            add_includedirs("apps/desktop/src/platform/macos/screen_capturer")
+        elseif is_os("linux") then
+            add_deps("privacy")
+            add_packages("libyuv")
+            add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_linux.cpp")
+            add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_x11.cpp")
+            add_files("apps/desktop/src/platform/linux/screen_capturer/display_resolution_linux.cpp")
+            add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_drm.cpp")
+            add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_factory.cpp")
+            if is_config("USE_WAYLAND", true) then
+                add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_wayland.cpp")
+                add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_wayland_portal.cpp")
+                add_files("apps/desktop/src/platform/linux/screen_capturer/screen_capturer_wayland_pipewire.cpp")
+            end
+            add_includedirs("apps/desktop/src/platform/linux/screen_capturer",
+                "apps/desktop/src/platform/linux/common")
+        end
+
+    if is_os("linux") then
+        target("headless_console")
+            set_kind("object")
+            add_deps("rd_log", "config_center", "assets")
+            add_includedirs("apps/desktop/src", {public = true})
+            add_files("apps/desktop/src/platform/linux/headless/headless_console.cpp",
+                "apps/desktop/src/platform/linux/headless/headless_settings.cpp")
+        target_end()
+
+    end
+
+    target("speaker_capturer")
+        set_kind("object")
+        add_deps("rd_log", "crossdesk_wire")
+        add_includedirs("apps/desktop/src/speaker_capturer", {public = true})
+        add_files("apps/desktop/src/speaker_capturer/speaker_capture_controller.cpp")
+        if is_os("windows") then
+            add_packages("miniaudio")
+            add_files("apps/desktop/src/platform/windows/speaker_capturer/*.cpp")
+            add_includedirs("apps/desktop/src/platform/windows/speaker_capturer")
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/speaker_capturer/*.cpp")
+            add_files("apps/desktop/src/platform/macos/speaker_capturer/*.mm",
+                {mxxflags = "-fobjc-arc"})
+            add_includedirs("apps/desktop/src/platform/macos/speaker_capturer")
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/speaker_capturer/*.cpp")
+            add_includedirs("apps/desktop/src/platform/linux/speaker_capturer")
+        end
+
+    target("device_controller")
+        set_kind("object")
+        add_deps("rd_log", "desktop_common", "crossdesk_wire")
+        add_includedirs("apps/desktop/src/device_controller", {public = true})
+        add_includedirs("apps/desktop/src/platform/common/input")
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/input/mouse/*.cpp",
+                "apps/desktop/src/platform/windows/input/keyboard/*.cpp",
+                "apps/desktop/src/platform/windows/input/windows_input_injector.cpp",
+                "apps/desktop/src/platform/windows/input/device_controller_factory.cpp")
+            add_includedirs("apps/desktop/src/platform/windows",
+                "apps/desktop/src/platform/windows/service",
+                "apps/desktop/src/platform/windows/input/mouse",
+                "apps/desktop/src/platform/windows/input/keyboard",
+                "apps/desktop/src/platform/windows/input")
+            add_syslinks("Wtsapi32", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/input/mouse/*.cpp",
+                "apps/desktop/src/platform/macos/input/keyboard/*.cpp",
+                "apps/desktop/src/platform/macos/input/device_controller_factory.cpp")
+            add_includedirs("apps/desktop/src/platform/macos/input/mouse",
+                "apps/desktop/src/platform/macos/input/keyboard",
+                "apps/desktop/src/platform/macos/input")
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/input/mouse/*.cpp",
+                "apps/desktop/src/platform/linux/input/keyboard/*.cpp",
+                "apps/desktop/src/platform/linux/input/device_controller_factory.cpp")
+            add_syslinks("Xi", {public = true})
+            add_includedirs("apps/desktop/src/platform/linux/input/mouse",
+                "apps/desktop/src/platform/linux/input/keyboard",
+                "apps/desktop/src/platform/linux/input",
+                "apps/desktop/src/platform/linux/common")
+        end
+
+    target("thumbnail")
+        set_kind("object")
+        add_packages("libyuv", "openssl3", "nlohmann_json")
+        add_deps("rd_log", "desktop_common")
+        add_files("apps/desktop/src/thumbnail/*.cpp")
+        add_includedirs("apps/desktop/src/thumbnail", {public = true})
+
+    target("autostart")
+        set_kind("object")
+        add_deps("rd_log")
+        add_files("apps/desktop/src/autostart/*.cpp")
+        if is_os("windows") then
+            if is_config("CROSSDESK_PORTABLE", true) then
+                add_defines("CROSSDESK_PORTABLE=1")
+            end
+            add_files("apps/desktop/src/platform/windows/autostart.cpp")
+            add_syslinks("Advapi32", "Ole32", "OleAut32", "Taskschd", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/autostart.cpp")
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/autostart.cpp")
+        end
+        add_includedirs("apps/desktop/src")
+        add_includedirs("apps/desktop/src/autostart", {public = true})
+
+    if is_os("windows") then
+        target("windows_unattended_config")
+            set_kind("object")
+            add_deps("private_file")
+            add_packages("nlohmann_json")
+            add_files("apps/desktop/src/platform/windows/service/unattended_config.cpp")
+            add_files("apps/desktop/src/platform/windows/service/shared_identity.cpp")
+            add_includedirs("apps/desktop/src")
+            add_includedirs("apps/desktop/src/platform/windows/service")
+            add_syslinks("Advapi32", "Shell32", "Ole32", {public = true})
+
+        target("windows_unattended_security_test")
+            set_kind("binary")
+            set_default(false)
+            add_deps("windows_unattended_config")
+            add_includedirs("apps/desktop/src/platform/windows/service")
+            add_files("apps/desktop/tests/windows_unattended_security_test.cpp")
+
+        target("windows_service_lifetime_test")
+            set_kind("binary")
+            set_default(false)
+            add_includedirs("apps/desktop/src/platform/windows/service")
+            add_files("apps/desktop/tests/windows_service_lifetime_test.cpp")
+
+        target("windows_autostart_test")
+            set_kind("binary")
+            set_default(false)
+            add_deps("autostart", "rd_log")
+            add_includedirs("apps/desktop/src")
+            if is_config("CROSSDESK_PORTABLE", true) then
+                add_defines("CROSSDESK_PORTABLE=1")
+            end
+            add_files("apps/desktop/tests/windows_autostart_test.cpp")
+
+        target("windows_runtime_daemon")
+            set_kind("static")
+            add_includedirs("apps/desktop/src", {public = true})
+            add_files("apps/desktop/src/platform/windows/runtime_daemon.cpp")
+            add_syslinks("User32", "Shell32", {public = true})
+    end
+
+    target("config_center")
+        set_kind("object")
+        add_packages("nlohmann_json")
+        add_deps("rd_log", "autostart")
+        if is_os("linux") then
+            add_deps("linux_runtime_daemon")
+        elseif is_os("windows") then
+            add_deps("windows_runtime_daemon")
+        elseif is_os("macosx") then
+            add_deps("macos_runtime_daemon")
+        end
+        add_files("apps/desktop/src/config_center/*.cpp")
+        add_includedirs("apps/desktop/src", "apps/desktop/src/config_center",
+            "deps/submodules/minirtc/src/api",
+            {public = true})
+
+    if is_os("linux") then
+        target("linux_runtime_daemon")
+            set_kind("static")
+            add_includedirs("apps/desktop/src", {public = true})
+            add_files("apps/desktop/src/platform/linux/runtime_daemon.cpp")
+            add_syslinks("dl", {public = true})
+    end
+
+    if is_os("macosx") then
+        target("macos_runtime_daemon")
+            set_kind("static")
+            add_includedirs("apps/desktop/src", {public = true})
+            add_files("apps/desktop/src/platform/macos/runtime_daemon.mm")
+            add_mxxflags("-fobjc-arc")
+            add_frameworks("AppKit", "CoreFoundation", {public = true})
+    end
+
+    target("assets")
+        set_kind("headeronly")
+        add_includedirs("apps/desktop/src/gui/assets/localization",
+            "apps/desktop/src/gui/assets/fonts", {public = true})
+
+    target("updater_core")
+        set_kind("static")
+        add_packages("cpp-httplib", "openssl3", "nlohmann_json")
+        add_deps("crossdesk_wire")
+        add_includedirs("apps/desktop/src", {public = true})
+        local update_key = get_config("CROSSDESK_UPDATE_PUBLIC_KEY") or
+            os.getenv("CROSSDESK_UPDATE_PUBLIC_KEY") or ""
+        on_load(function ()
+            assert(update_key == "" or (#update_key == 64 and update_key:match("^[0-9a-f]+$")),
+                "CROSSDESK_UPDATE_PUBLIC_KEY must be a 32-byte lowercase hex Ed25519 public key")
+        end)
+        add_files("apps/desktop/src/updater/update_core.cpp",
+            {defines = {version_define, "CROSSDESK_UPDATE_PUBLIC_KEY=\"" .. update_key .. "\""}})
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/updater/*.cpp")
+            add_syslinks("Advapi32", "Shell32", "Ole32", {public = true})
+        else
+            add_files("apps/desktop/src/platform/common/updater_posix.cpp")
+            if is_os("macosx") then
+                add_files("apps/desktop/src/platform/macos/updater/*.cpp")
+                add_syslinks("proc", {public = true})
+                add_defines("CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN")
+                add_frameworks("Security", "CoreFoundation", {public = true})
+            else
+                add_files("apps/desktop/src/platform/linux/updater/*.cpp")
+            end
+        end
+
+    if not is_config("CROSSDESK_PORTABLE", true) then
+        target("crossdesk_updater")
+            set_kind("binary")
+            add_deps("updater_core", "single_instance")
+            add_packages("nlohmann_json")
+            add_files("apps/desktop/src/updater/main.cpp")
+            if is_os("windows") then
+                add_files("apps/desktop/resources/windows/crossdesk_updater.rc",
+                    {defines = windows_resource_defines})
+            end
+    end
+
+    target("version_checker")
+        set_kind("object")
+        add_packages("cpp-httplib")
+        add_packages("nlohmann_json", {public = true})
+        add_deps("rd_log", "crossdesk_wire", "updater_core")
+        if is_config("CROSSDESK_PORTABLE", true) then
+            add_defines("CROSSDESK_PORTABLE=1")
+        end
+        add_files("apps/desktop/src/version_checker/*.cpp")
+        add_includedirs("apps/desktop/src/version_checker", {public = true})
+        if is_os("macosx") then
+            add_defines("CPPHTTPLIB_USE_CERTS_FROM_MACOSX_KEYCHAIN")
+            add_frameworks("Security", "CoreFoundation")
+        end
+
+    target("tools")
+        set_kind("object")
+        add_deps("rd_log", "desktop_common", "crossdesk_wire")
+        add_files("apps/desktop/src/tools/*.cpp")
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/clipboard.cpp",
+                "apps/desktop/src/platform/windows/clipboard_file_offer.cpp")
+            add_syslinks("ole32", "shlwapi", "uuid", {public = true})
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/clipboard.mm",
+                "apps/desktop/src/platform/macos/clipboard_file_offer.mm")
+            add_frameworks("CoreServices", {public = true})
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/clipboard.cpp",
+                "apps/desktop/src/platform/linux/clipboard_file_offer.cpp",
+                "apps/desktop/src/platform/linux/clipboard_fuse2_mount.cpp",
+                "apps/desktop/src/platform/linux/clipboard_fuse3_mount.cpp")
+            -- Only the FUSE headers are needed at build time. Load the runtime
+            -- dynamically so either installed major version can be used.
+            add_defines("_FILE_OFFSET_BITS=64")
+            add_packages("libsdl3")
+        end
+        add_includedirs("apps/desktop/src", "apps/desktop/src/tools", {public = true})
+        add_includedirs("libs/controller/include", {public = true})
+
+    target("gui")
+        set_kind("object")
+        add_rules("crossdesk.about_resources")
+        set_languages("c++20")
+        -- spdlog 1.14 bundles fmt 10, whose consteval parser is rejected by
+        -- current Apple Clang in C++20 mode. Keep the established dependency
+        -- version and use fmt's supported runtime-parser fallback here.
+        add_defines("FMT_CONSTEVAL=")
+        add_packages("slint", {public = true})
+        add_packages("libyuv", "tinyfiledialogs", "openssl3", "libsdl3", "nlohmann_json", "asio", "websocketpp")
+        add_defines("ASIO_STANDALONE")
+        add_files("apps/desktop/src/network/lan/*.cpp")
+        if not is_config("CROSSDESK_PORTABLE", true) then
+            add_defines("CROSSDESK_HAS_UPDATER=1", {public = true})
+            add_deps("updater_core")
+            add_files("apps/desktop/src/updater/update_controller.cpp")
+        end
+        if is_config("CROSSDESK_PORTABLE", true) then
+            -- RuntimeState changes layout in portable builds. Consumers of GUI
+            -- headers must see the same definition, without affecting its deps.
+            add_defines("CROSSDESK_PORTABLE=1", {public = true})
+        end
+        add_deps("rd_log", "desktop_common", "assets", "config_center", "minirtc",
+            "single_instance",
+            "path_manager", "screen_capturer", "speaker_capturer",
+            "device_controller", "thumbnail", "version_checker", "tools",
+            "crossdesk_wire", "crossdesk_file_browser", "privacy", "crossdesk_ui")
+        add_files("apps/desktop/src/gui/render.cpp", "apps/desktop/src/gui/application/gui_application.cpp",
+            "apps/desktop/src/gui/rendering/*.cpp",
+            "apps/desktop/src/gui/runtime/*.cpp",
+            "apps/desktop/src/gui/features/about/*.cpp",
+            "apps/desktop/src/gui/features/feedback/*.cpp",
+            "apps/desktop/src/platform/common/gui/service_status_runtime.cpp",
+            "apps/desktop/src/gui/features/devices/*.cpp", "apps/desktop/src/gui/features/input/*.cpp",
+            "apps/desktop/src/gui/features/clipboard/*.cpp", "apps/desktop/src/gui/features/file_transfer/*.cpp",
+            "apps/desktop/src/gui/features/settings/*.cpp", "apps/desktop/src/gui/features/gallery/*.cpp")
+        -- Only these translation units consume the application version. Keep
+        -- version changes out of the flags for media and the rest of the GUI.
+        add_files("apps/desktop/src/gui/application/gui_application.cpp",
+            "apps/desktop/src/gui/runtime/peer_event_handler.cpp",
+            {defines = version_define})
+        add_includedirs("apps/desktop/src", "apps/desktop/src/gui", {public = true})
+        add_includedirs("apps/desktop/src/platform/common/input")
+        if is_os("windows") then
+            add_cxxflags("/bigobj")
+            add_deps("windows_unattended_config")
+            add_files("apps/desktop/src/platform/windows/gui/application/unattended_application.cpp")
+            add_files("apps/desktop/src/platform/windows/gui/application/local_host_application.cpp",
+                "apps/desktop/src/platform/windows/service/local_host_channel.cpp")
+            add_syslinks("Wtsapi32")
+            add_links("opengl32")
+            add_syslinks("Comctl32", "Iphlpapi", "Ws2_32", "Advapi32", {public = true})
+            add_files("apps/desktop/src/platform/windows/gui/tray/win_tray.cpp",
+                "apps/desktop/src/platform/windows/gui/slint_backend.cpp",
+                "apps/desktop/src/platform/windows/gui/window_icons.cpp",
+                "apps/desktop/src/platform/windows/gui/window_taskbar.cpp",
+                "apps/desktop/src/platform/windows/gui/session_end_observer.cpp",
+                "apps/desktop/src/platform/windows/gui/slint_renderer_probe.cpp",
+                "apps/desktop/src/platform/common/gui/opengl_video_renderer.cpp",
+                "apps/desktop/src/platform/common/gui/cuda_driver.cpp",
+                "apps/desktop/src/platform/common/gui/cuda_opengl_interop.cpp",
+                "apps/desktop/src/platform/common/gui/video_renderer_factory_opengl.cpp",
+                "apps/desktop/src/platform/windows/gui/runtime/windows_service_runtime.cpp",
+                "apps/desktop/src/platform/windows/gui/application/portable_service_integration.cpp")
+            add_includedirs("apps/desktop/src/platform/common/gui",
+                "apps/desktop/src/platform/windows/gui/tray")
+            add_includedirs("apps/desktop/src/platform/windows/service")
+        elseif is_os("macosx") then
+            add_files("apps/desktop/src/platform/macos/gui/runtime/*.mm",
+                "apps/desktop/src/platform/macos/gui/tray/*.mm",
+                "apps/desktop/src/platform/macos/gui/window_drag_mac.mm",
+                "apps/desktop/src/platform/macos/gui/metal_video_renderer.mm",
+                "apps/desktop/src/platform/macos/gui/video_frame_scheduler.mm",
+                "apps/desktop/src/platform/macos/gui/video_renderer_factory_metal.mm")
+            add_frameworks("Security", "UniformTypeIdentifiers", {public = true})
+            add_includedirs("apps/desktop/src/platform/macos/gui",
+                "apps/desktop/src/platform/macos/gui/tray")
+        elseif is_os("linux") then
+            add_links("GL")
+            add_deps("headless_console")
+            add_files("apps/desktop/src/platform/linux/gui/tray/linux_tray.cpp",
+                "apps/desktop/src/platform/linux/gui/wayland_activation.cpp",
+                "apps/desktop/src/platform/linux/gui/cuda_graphics.cpp",
+                "apps/desktop/src/platform/common/gui/opengl_video_renderer.cpp",
+                "apps/desktop/src/platform/common/gui/cuda_driver.cpp",
+                "apps/desktop/src/platform/common/gui/cuda_opengl_interop.cpp",
+                "apps/desktop/src/platform/common/gui/video_renderer_factory_opengl.cpp")
+            add_includedirs("apps/desktop/src/platform/common/gui",
+                "apps/desktop/src/platform/linux/gui/tray",
+                "apps/desktop/src/platform/linux/common")
+        end
+
+    if is_os("windows") then
+        target("wgc_plugin")
+            set_kind("shared")
+            add_packages("libyuv")
+            add_deps("rd_log", "path_manager", "crossdesk_wire")
+            add_defines("CROSSDESK_WGC_PLUGIN_BUILD=1")
+            -- Keep the project on C++17 while C++/WinRT still falls back to
+            -- MSVC's deprecated experimental coroutine header.
+            add_defines("_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS")
+            add_links("windowsapp")
+            add_files("apps/desktop/src/platform/windows/screen_capturer/screen_capturer_wgc.cpp",
+                "apps/desktop/src/platform/windows/screen_capturer/wgc_session_impl.cpp",
+                "apps/desktop/src/platform/windows/screen_capturer/wgc_plugin_entry.cpp")
+            add_files("apps/desktop/resources/windows/wgc_plugin.rc",
+                {defines = windows_resource_defines})
+            add_includedirs("apps/desktop/src/common", "apps/desktop/src/screen_capturer",
+                "apps/desktop/src/platform/windows/screen_capturer",
+                "deps/submodules/minirtc/src/api")
+
+        target("crossdesk_service")
+            set_kind("binary")
+            add_packages("nlohmann_json")
+            add_includedirs("libs/wire/include")
+            add_deps("rd_log", "path_manager", "windows_unattended_config")
+            add_links("Advapi32", "Wtsapi32", "Ole32", "Userenv")
+            add_files("apps/desktop/src/platform/windows/service/main.cpp",
+                "apps/desktop/src/platform/windows/service/service_host.cpp",
+                "apps/desktop/src/platform/windows/service/rdp_session_handoff.cpp")
+            add_files("apps/desktop/resources/windows/crossdesk_service.rc",
+                {defines = windows_resource_defines})
+            add_includedirs("apps/desktop/src/platform/windows/service",
+                "apps/desktop/src/platform/windows/screen_capturer")
+
+        target("crossdesk_session_helper")
+            set_kind("binary")
+              add_deps("crossdesk_privacy_cursor_helper", {inherit = false})
+              add_deps("wgc_plugin", {inherit = false})
+            add_packages("libyuv", "nlohmann_json")
+            add_deps("rd_log", "path_manager")
+            add_links("Advapi32", "User32", "Wtsapi32", "Gdi32", "Setupapi",
+                  "d3d11", "dxgi", "RuntimeObject")
+            add_files("apps/desktop/src/platform/windows/service/session_helper_main.cpp")
+              add_files("apps/desktop/src/platform/windows/privacy/privacy_cursor_guard.cpp")
+            add_files("apps/desktop/src/platform/windows/virtual_display/usbmmidd_virtual_display.cpp")
+            add_files("apps/desktop/resources/windows/crossdesk_session_helper.rc",
+                {defines = windows_resource_defines})
+            add_includedirs("apps/desktop/src/common",
+                  "apps/desktop/src/screen_capturer", "deps/submodules/minirtc/src/api",
+                "apps/desktop/src/platform/windows/service",
+                "apps/desktop/src/platform/windows/screen_capturer",
+                "apps/desktop/src/platform/windows/virtual_display")
+            add_includedirs("apps/desktop/src/platform/windows/input",
+                "apps/desktop/src/platform/common/input")
+            add_includedirs("libs/wire/include")
+    end
+
+    target("crossdesk")
+        set_kind("binary")
+        add_deps("rd_log", "desktop_common", "gui", "single_instance")
+        if not is_config("CROSSDESK_PORTABLE", true) then
+            add_deps("crossdesk_updater", {inherit = false})
+        end
+        add_files("apps/desktop/src/app/*.cpp")
+        add_includedirs("apps/desktop/src", "apps/desktop/src/app", {public = true})
+        if is_os("windows") then
+            add_files("apps/desktop/src/platform/windows/service/autostart_control.cpp",
+                "apps/desktop/src/platform/windows/service/autostart_state.cpp")
+            add_files("apps/desktop/src/platform/windows/service/service_host.cpp",
+                "apps/desktop/src/platform/windows/service/rdp_session_handoff.cpp")
+            add_includedirs("apps/desktop/src/platform/windows/service",
+                "apps/desktop/src/platform/windows/screen_capturer")
+            add_links("Advapi32", "Wtsapi32", "Ole32", "Userenv")
+            add_deps("wgc_plugin", "crossdesk_service", "crossdesk_session_helper")
+            add_files(crossdesk_windows_resource, {defines = windows_resource_defines})
+        elseif is_os("linux") then
+            add_files("apps/desktop/src/platform/linux/headless/headless_session.cpp")
+        end
+        add_rules("crossdesk.slint_runtime")
+        after_build(copy_usbmmidd_package)
+end

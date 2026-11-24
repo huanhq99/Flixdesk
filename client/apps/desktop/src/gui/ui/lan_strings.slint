@@ -1,0 +1,58 @@
+import { GalleryStrings } from "device_strings.slint";
+
+export global LanStrings {
+    // Short localized lines let the warning dialog add leading even though
+    // Slint Text does not expose a line-height property.
+    public pure function access-error-lines(code: string) -> [string] {
+        if code == "LanPortInUse" { return [
+            GalleryStrings.texts[0],
+            GalleryStrings.texts[1],
+            GalleryStrings.texts[2]
+        ]; }
+        if code == "LanPortCheckFailed" { return [
+            GalleryStrings.texts[3],
+            GalleryStrings.texts[4],
+            GalleryStrings.texts[2]
+        ]; }
+        if code == "LanPortPermissionDenied" { return [
+            GalleryStrings.texts[5],
+            GalleryStrings.texts[6],
+            GalleryStrings.texts[2]
+        ]; }
+        if code == "Selected LAN interface is unavailable" { return [
+            GalleryStrings.texts[7],
+            GalleryStrings.texts[8],
+            GalleryStrings.texts[9]
+        ]; }
+        // Keep all branches the same size for Slint's C++ model generator.
+        return ["", "", ""];
+    }
+    public pure function error-message(code: string) -> string {
+        let lines = LanStrings.access-error-lines(code);
+        if lines[0] != "" {
+            let separator = GalleryStrings.texts[10];
+            return lines[0] + separator + lines[1] + separator + lines[2];
+        }
+        if code == "" { return ""; }
+        if code == "InvalidCredentials" { return GalleryStrings.texts[11]; }
+        if code == "AuthenticationRateLimited" { return GalleryStrings.texts[12]; }
+        if code == "CredentialsChanged" { return GalleryStrings.texts[13]; }
+        if code == "Busy" { return GalleryStrings.texts[14]; }
+        if code == "LAN password must contain exactly 6 ASCII letters or digits" { return GalleryStrings.texts[15]; }
+        if code == "ConnectionFailed" || code == "ConnectionTimeout" || code == "IceConnectionTimeout" || code == "Timeout" || code == "ConnectionClosed" || code == "HeartbeatTimeout" || code == "SignalSendFailed" { return GalleryStrings.texts[16]; }
+        if code == "Invalid LAN endpoint" { return GalleryStrings.texts[17]; }
+        if code == "Invalid LAN port" { return GalleryStrings.texts[18]; }
+        if code == "LAN password is not ready" { return GalleryStrings.texts[19]; }
+        if code == "LAN connection limit reached" { return GalleryStrings.texts[20]; }
+        if code == "UnsupportedNetworkPath" || code == "NetworkPolicyFailed" { return GalleryStrings.texts[21]; }
+        if code == "IncompatibleProtocol" || code == "RequiredCryptoUnsupported" || code == "TLS 1.3 is required for LAN connections" { return GalleryStrings.texts[22]; }
+        if code == "InvalidCertificate" || code == "FingerprintMissing" || code == "FingerprintMismatch" { return GalleryStrings.texts[23]; }
+        if code == "DtlsHandshakeFailed" || code == "SrtpInstallFailed" || code == "SrtpKeyExportFailed" || code == "SecureTransportFailed" { return GalleryStrings.texts[24]; }
+        if code == "InvalidSignal" || code == "InvalidLocalSignal" || code == "Invalid LAN protocol message" { return GalleryStrings.texts[25]; }
+        if code == "ListenerChanged" { return GalleryStrings.texts[26]; }
+        if code == "PeerPreparationFailed" { return GalleryStrings.texts[27]; }
+        if code == "Cannot copy text" { return GalleryStrings.texts[28]; }
+        // Keep diagnostic details for unexpected system errors, with a localized explanation.
+        return GalleryStrings.texts[29] + code;
+    }
+}

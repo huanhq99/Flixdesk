@@ -1,0 +1,1926 @@
+#include "device_db_manager.h"
+#include "controller_identity.h"
+
+#include <openssl/rand.h>
+
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <filesystem>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <set>
+#include <sstream>
+#include <stdexcept>
+
+#include "log.h"
+
+namespace {
+
+std::string ColumnText(sqlite3_stmt* stmt, int column) {
+  const unsigned char* text = sqlite3_column_text(stmt, column);
+  return text ? reinterpret_cast<const char*>(text) : "";
+}
+
+std::string SqliteExecError(sqlite3* db, char* err_msg) {
+  return err_msg ? std::string(err_msg) : std::string(sqlite3_errmsg(db));
+}
+
+std::string EscapeLikePattern(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (char ch : value) {
+    if (ch == '%' || ch == '_' || ch == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(ch);
+  }
+  return escaped;
+}
+
+std::string ToLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+std::string NormalizeRemoteDeviceId(const std::string& device_id) {
+  return device_id.rfind("C-", 0) == 0 ? device_id.substr(2) : device_id;
+}
+
+std::vector<std::string> SplitCommaSeparatedIds(const std::string& value) {
+  std::vector<std::string> result;
+  size_t start = 0;
+  while (start <= value.size()) {
+    size_t end = value.find(',', start);
+    std::string item =
+        value.substr(start, end == std::string::npos ? std::string::npos
+                                                     : end - start);
+    if (!item.empty()) {
+      result.push_back(item);
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  std::sort(result.begin(), result.end());
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+std::string DevicePresenceKindClause(const std::string& kind) {
+  std::string normalized = ToLower(kind);
+  if (normalized == "web") return "device_id LIKE 'web-%' ";
+  if (normalized == "cli") return "device_id LIKE 'cli-%' ";
+  if (normalized == "all") {
+    return "device_id NOT LIKE 'C-%' ";
+  }
+  const std::string native_clause =
+      "device_id NOT LIKE 'web-%' AND device_id NOT LIKE 'cli-%' "
+      "AND device_id NOT LIKE 'C-%' ";
+  const std::string mobile_platforms =
+      "AND LOWER(COALESCE(client_platform, '')) ";
+  if (normalized == "mobile") {
+    return native_clause + mobile_platforms + "IN ('ios', 'android') ";
+  }
+  return native_clause + mobile_platforms + "NOT IN ('ios', 'android') ";
+}
+
+std::string DevicePresenceFilterClause(const std::string& filter,
+                                       const std::string& kind) {
+  std::string normalized = ToLower(filter);
+  if (normalized == "web") return "device_id LIKE 'web-%' ";
+  if (normalized == "cli") return "device_id LIKE 'cli-%' ";
+
+  std::string clause = DevicePresenceKindClause(kind);
+  if (normalized == "online") {
+    clause += "AND online = 1 ";
+  } else if (normalized == "offline") {
+    clause += "AND online = 0 ";
+  } else if (normalized == "active") {
+    clause +=
+        "AND EXISTS ("
+        "SELECT 1 FROM remote_control_sessions "
+        "WHERE normalized_host_id = device_presence.device_id) ";
+  }
+  return clause;
+}
+
+std::string DevicePresenceSortClause(const std::string& sort,
+                                     const std::string& order) {
+  const std::string direction = ToLower(order) == "asc" ? "ASC" : "DESC";
+  const std::string normalized = ToLower(sort);
+
+  if (normalized == "status") {
+    return "online " + direction + ", updated_at DESC, device_id ASC ";
+  }
+
+  std::string expression = "updated_at";
+  if (normalized == "device_id" || normalized == "id") {
+    expression = "device_id";
+  } else if (normalized == "online_since") {
+    expression = "online_since";
+  } else if (normalized == "current_online") {
+    expression = "online_duration_seconds";
+  } else if (normalized == "active_sessions") {
+    expression = "active_control_count";
+  }
+
+  return expression + " " + direction +
+         ", online DESC, updated_at DESC, device_id ASC ";
+}
+
+std::string DeviceClientFilterClause(const std::string& platform,
+                                     const std::string& version) {
+  std::string clause;
+  if (!platform.empty()) clause += "AND client_platform = ? ";
+  if (!version.empty()) clause += "AND client_version = ? ";
+  return clause;
+}
+
+void BindDeviceClientFilters(sqlite3_stmt* stmt, int& bind_index,
+                             const std::string& platform,
+                             const std::string& version) {
+  for (const auto* value : {&platform, &version}) {
+    if (!value->empty()) {
+      sqlite3_bind_text(stmt, bind_index++, value->c_str(), -1, SQLITE_TRANSIENT);
+    }
+  }
+}
+
+bool ColumnExists(sqlite3* db, const std::string& table,
+                  const std::string& column) {
+  std::string sql = "PRAGMA table_info(" + table + ");";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+
+  bool found = false;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    if (ColumnText(stmt, 1) == column) {
+      found = true;
+      break;
+    }
+  }
+  sqlite3_finalize(stmt);
+  return found;
+}
+
+void EnsureIntegerColumn(sqlite3* db, const std::string& table,
+                         const std::string& column) {
+  if (ColumnExists(db, table, column)) {
+    return;
+  }
+
+  std::string sql = "ALTER TABLE " + table + " ADD COLUMN " + column +
+                    " INTEGER NOT NULL DEFAULT 0;";
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db, err_msg);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to add " + table + "." + column +
+                             " column: " + error);
+  }
+}
+
+void EnsureTextColumn(sqlite3* db, const std::string& table,
+                      const std::string& column) {
+  if (ColumnExists(db, table, column)) {
+    return;
+  }
+
+  std::string sql = "ALTER TABLE " + table + " ADD COLUMN " + column +
+                    " TEXT NOT NULL DEFAULT '';";
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db, err_msg);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to add " + table + "." + column +
+                             " column: " + error);
+  }
+}
+
+void ExecuteSchemaStatement(sqlite3* db, const std::string& sql,
+                            const std::string& description) {
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db, err_msg);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to " + description + ": " + error);
+  }
+}
+
+int64_t NowSeconds() {
+  return std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+constexpr int64_t kRemoteControlRecoveryWindowSeconds = 120;
+
+}  // namespace
+
+DeviceDBManager::DeviceDBManager(const std::string& db_path, OpenMode mode)
+    : db_(nullptr) {
+  try {
+    std::filesystem::path path(db_path);
+    if (mode == OpenMode::ReadWrite && !path.parent_path().empty()) {
+      std::filesystem::create_directories(path.parent_path());
+    }
+  } catch (const std::exception& e) {
+    throw std::runtime_error("Failed to create parent directory for DB: " +
+                             std::string(e.what()));
+  }
+
+  const int flags = mode == OpenMode::ReadOnly
+                        ? SQLITE_OPEN_READONLY
+                        : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE;
+  int rc = sqlite3_open_v2(db_path.c_str(), &db_, flags, nullptr);
+  if (rc != SQLITE_OK) {
+    std::string error =
+        db_ ? sqlite3_errmsg(db_) : std::string(sqlite3_errstr(rc));
+    LOG_ERROR("Failed to open database, {}", error);
+    if (db_) {
+      sqlite3_close(db_);
+    }
+    db_ = nullptr;
+    throw std::runtime_error("Failed to open database: " + error);
+  }
+  try {
+    sqlite3_busy_timeout(db_, 1000);
+    if (mode == OpenMode::ReadWrite) {
+      ExecuteSchemaStatement(db_, "PRAGMA journal_mode=WAL;", "enable WAL");
+      ExecuteSchemaStatement(db_, "PRAGMA secure_delete=ON;", "enable secure deletion");
+      InitDB();
+    }
+  } catch (...) {
+    sqlite3_close(db_);
+    db_ = nullptr;
+    throw;
+  }
+}
+
+void DeviceDBManager::SetReadDeadline(
+    std::chrono::steady_clock::time_point deadline) {
+  read_deadline_ = deadline;
+  sqlite3_progress_handler(
+      db_, 1000,
+      [](void* data) -> int {
+        return std::chrono::steady_clock::now() >=
+               static_cast<DeviceDBManager*>(data)->read_deadline_;
+      },
+      this);
+}
+
+bool DeviceDBManager::ClearReadDeadline() {
+  const bool expired = std::chrono::steady_clock::now() >= read_deadline_;
+  sqlite3_progress_handler(db_, 0, nullptr, nullptr);
+  read_deadline_ = std::chrono::steady_clock::time_point::max();
+  return expired;
+}
+
+DeviceDBManager::~DeviceDBManager() {
+  if (db_) sqlite3_close(db_);
+}
+
+void DeviceDBManager::InitDB() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in InitDB.");
+    throw std::runtime_error("Database is not initialized in InitDB.");
+  }
+
+  ExecuteSchemaStatement(db_,
+      "CREATE TABLE IF NOT EXISTS admin_data_audit ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT, created_at INTEGER NOT NULL,"
+      "actor TEXT NOT NULL, request_ref TEXT NOT NULL, action TEXT NOT NULL,"
+      "scope TEXT NOT NULL, result TEXT NOT NULL);",
+      "create admin data audit");
+  ExecuteSchemaStatement(db_,
+      "CREATE INDEX IF NOT EXISTS idx_admin_data_audit_created_at "
+      "ON admin_data_audit(created_at);", "index admin data audit");
+
+  const char* sql_devices =
+      "CREATE TABLE IF NOT EXISTS devices ("
+      "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+      "device_id TEXT UNIQUE NOT NULL,"
+      "password_salt TEXT NOT NULL,"
+      "password_hash TEXT NOT NULL);";
+
+  const char* sql_seq =
+      "CREATE TABLE IF NOT EXISTS device_id_seq ("
+      "next_id INTEGER NOT NULL);";
+
+  const char* sql_seq_init =
+      "INSERT INTO device_id_seq (next_id) "
+      "SELECT 1 WHERE NOT EXISTS (SELECT 1 FROM device_id_seq);";
+
+  const char* sql_presence =
+      "CREATE TABLE IF NOT EXISTS device_presence ("
+      "device_id TEXT PRIMARY KEY,"
+      "online INTEGER NOT NULL,"
+      "updated_at INTEGER NOT NULL,"
+      "online_since INTEGER NOT NULL DEFAULT 0"
+      ");";
+
+  const char* sql_user_devices =
+      "CREATE TABLE IF NOT EXISTS user_devices ("
+      "user_id TEXT NOT NULL,"
+      "device_id TEXT NOT NULL,"
+      "PRIMARY KEY (user_id, device_id)"
+      ");";
+
+  const char* sql_remote_control_sessions =
+      "CREATE TABLE IF NOT EXISTS remote_control_sessions ("
+      "transmission_id TEXT NOT NULL,"
+      "guest_id TEXT NOT NULL,"
+      "host_id TEXT NOT NULL,"
+      "normalized_guest_id TEXT NOT NULL DEFAULT '',"
+      "normalized_host_id TEXT NOT NULL DEFAULT '',"
+      "started_at INTEGER NOT NULL,"
+      "PRIMARY KEY (transmission_id, guest_id)"
+      ");";
+
+  const char* sql_server_runtime =
+      "CREATE TABLE IF NOT EXISTS server_runtime ("
+      "id INTEGER PRIMARY KEY CHECK(id = 1),"
+      "last_seen_at INTEGER NOT NULL DEFAULT 0"
+      ");";
+
+  const char* sql_server_runtime_init =
+      "INSERT INTO server_runtime (id, last_seen_at) "
+      "SELECT 1, 0 WHERE NOT EXISTS "
+      "(SELECT 1 FROM server_runtime WHERE id = 1);";
+
+  char* err_msg = nullptr;
+
+  if (sqlite3_exec(db_, sql_devices, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create devices table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create devices table: " + error);
+  }
+
+  EnsureTextColumn(db_, "devices", "login_public_key");
+  ExecuteSchemaStatement(db_,
+      "BEGIN IMMEDIATE;"
+      // Old device rules refer to password targets, not authenticated sources.
+      // Carry forward only IP rules; never reinterpret an old target ban.
+      "CREATE TABLE IF NOT EXISTS auth_risk_rules ("
+      "scope TEXT NOT NULL CHECK(scope IN ('device','ip')), target TEXT NOT NULL,"
+      "expires_at INTEGER NOT NULL, reason TEXT NOT NULL,"
+      "PRIMARY KEY(scope,target));"
+      "CREATE TABLE IF NOT EXISTS auth_source_rules ("
+      "scope TEXT NOT NULL CHECK(scope IN ('controller','ip')), target TEXT NOT NULL,"
+      "expires_at INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(scope,target));"
+      "INSERT OR IGNORE INTO auth_source_rules SELECT * FROM auth_risk_rules "
+      "WHERE scope='ip' AND expires_at>CAST(strftime('%s','now') AS INTEGER);"
+      "DROP TABLE auth_risk_rules;"
+      "DELETE FROM auth_source_rules WHERE expires_at<=CAST(strftime('%s','now') AS INTEGER);"
+      "COMMIT;",
+      "initialize password risk rules");
+  ExecuteSchemaStatement(db_,
+      "CREATE TABLE IF NOT EXISTS device_reconnect_credentials ("
+      "device_id TEXT PRIMARY KEY, token_hash TEXT NOT NULL,"
+      "expires_at INTEGER NOT NULL);"
+      "CREATE TRIGGER IF NOT EXISTS reconnect_credential_delete "
+      "AFTER DELETE ON devices BEGIN "
+      "DELETE FROM device_reconnect_credentials WHERE device_id=OLD.device_id; END;"
+      "CREATE TRIGGER IF NOT EXISTS reconnect_credential_password_change "
+      "AFTER UPDATE OF password_salt,password_hash ON devices "
+      "WHEN OLD.password_salt<>NEW.password_salt OR OLD.password_hash<>NEW.password_hash "
+      "BEGIN DELETE FROM device_reconnect_credentials WHERE device_id=OLD.device_id; END;"
+      "CREATE TRIGGER IF NOT EXISTS reconnect_credential_key_binding "
+      "AFTER UPDATE OF login_public_key ON devices "
+      "WHEN NEW.login_public_key<>'' "
+      "BEGIN DELETE FROM device_reconnect_credentials WHERE device_id=OLD.device_id; END;"
+      "DELETE FROM device_reconnect_credentials WHERE expires_at <= "
+      "CAST(strftime('%s','now') AS INTEGER) OR NOT EXISTS "
+      "(SELECT 1 FROM devices WHERE devices.device_id=device_reconnect_credentials.device_id);",
+      "initialize reconnect credentials");
+
+  // Older cleanup retained credentials after deleting their presence. Their
+  // offline age is unknown, so start a fallback retention period at migration.
+  // Presence timestamps take precedence whenever they are still available.
+  if (!ColumnExists(db_, "devices", "retention_started_at")) {
+    ExecuteSchemaStatement(db_, "BEGIN IMMEDIATE;",
+                           "begin device retention migration");
+    try {
+      EnsureIntegerColumn(db_, "devices", "retention_started_at");
+      ExecuteSchemaStatement(db_,
+          "UPDATE devices SET retention_started_at = "
+          "CAST(strftime('%s','now') AS INTEGER);",
+          "initialize device retention timestamps");
+      ExecuteSchemaStatement(db_, "COMMIT;", "commit device retention migration");
+    } catch (...) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      throw;
+    }
+  }
+  ExecuteSchemaStatement(db_,
+      "CREATE INDEX IF NOT EXISTS idx_devices_retention_started_at "
+      "ON devices(retention_started_at);", "index device retention timestamps");
+
+  if (sqlite3_exec(db_, sql_seq, nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create device_id_seq table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create device_id_seq table: " + error);
+  }
+
+  if (sqlite3_exec(db_, sql_seq_init, nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to initialize device_id_seq: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to initialize device_id_seq: " + error);
+  }
+
+  if (sqlite3_exec(db_, sql_presence, nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create device_presence table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create device_presence table: " +
+                             error);
+  }
+
+  EnsureIntegerColumn(db_, "device_presence", "online_since");
+  EnsureTextColumn(db_, "device_presence", "client_version");
+  EnsureTextColumn(db_, "device_presence", "client_platform");
+
+  const char* sql_presence_backfill =
+      "UPDATE device_presence SET online_since = updated_at "
+      "WHERE online = 1 AND online_since = 0;";
+  if (sqlite3_exec(db_, sql_presence_backfill, nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to backfill device_presence online_since: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to backfill device_presence: " + error);
+  }
+
+  if (sqlite3_exec(db_, sql_user_devices, nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create user_devices table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create user_devices table: " + error);
+  }
+
+  // Old association rows have no timestamp. Start their retention period once,
+  // at migration, rather than guessing their age or deleting them immediately.
+  if (!ColumnExists(db_, "user_devices", "updated_at")) {
+    ExecuteSchemaStatement(db_, "BEGIN IMMEDIATE;", "begin retention migration");
+    try {
+      EnsureIntegerColumn(db_, "user_devices", "updated_at");
+      ExecuteSchemaStatement(db_,
+          "UPDATE user_devices SET updated_at = CAST(strftime('%s','now') AS INTEGER);",
+          "initialize association retention timestamps");
+      ExecuteSchemaStatement(db_, "COMMIT;", "commit retention migration");
+    } catch (...) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      throw;
+    }
+  }
+  ExecuteSchemaStatement(db_,
+      "CREATE INDEX IF NOT EXISTS idx_user_devices_updated_at ON user_devices(updated_at);",
+      "index association retention timestamps");
+  ExecuteSchemaStatement(db_,
+      "CREATE INDEX IF NOT EXISTS idx_user_devices_device_id ON user_devices(device_id);",
+      "index associated device ids");
+
+  if (sqlite3_exec(db_, sql_remote_control_sessions, nullptr, nullptr,
+                   &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create remote_control_sessions table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create remote_control_sessions table: " +
+                             error);
+  }
+  EnsureTextColumn(db_, "remote_control_sessions", "normalized_guest_id");
+  EnsureTextColumn(db_, "remote_control_sessions", "normalized_host_id");
+  EnsureIntegerColumn(db_, "remote_control_sessions", "activity_confirmed");
+  InitDailyControllerActivity();
+  ExecuteSchemaStatement(
+      db_,
+      "UPDATE remote_control_sessions SET "
+      "normalized_guest_id = CASE WHEN guest_id LIKE 'C-%' "
+      "THEN substr(guest_id, 3) ELSE guest_id END "
+      "WHERE normalized_guest_id = '';",
+      "backfill remote_control_sessions.normalized_guest_id");
+  ExecuteSchemaStatement(
+      db_,
+      "UPDATE remote_control_sessions SET "
+      "normalized_host_id = CASE WHEN host_id LIKE 'C-%' "
+      "THEN substr(host_id, 3) ELSE host_id END "
+      "WHERE normalized_host_id = '';",
+      "backfill remote_control_sessions.normalized_host_id");
+
+  const std::vector<std::pair<std::string, std::string>> indexes = {
+      {"CREATE INDEX IF NOT EXISTS idx_device_presence_online_updated_at "
+       "ON device_presence(online, updated_at);",
+       "create idx_device_presence_online_updated_at"},
+      {"CREATE INDEX IF NOT EXISTS idx_device_presence_updated_at "
+       "ON device_presence(updated_at);",
+       "create idx_device_presence_updated_at"},
+      {"CREATE INDEX IF NOT EXISTS idx_remote_control_sessions_norm_guest "
+       "ON remote_control_sessions(normalized_guest_id);",
+       "create idx_remote_control_sessions_norm_guest"},
+      {"CREATE INDEX IF NOT EXISTS idx_remote_control_sessions_norm_host "
+       "ON remote_control_sessions(normalized_host_id);",
+       "create idx_remote_control_sessions_norm_host"},
+      {"CREATE INDEX IF NOT EXISTS idx_remote_control_sessions_host_tx "
+       "ON remote_control_sessions(host_id, transmission_id);",
+       "create idx_remote_control_sessions_host_tx"}};
+  for (const auto& index : indexes) {
+    ExecuteSchemaStatement(db_, index.first, index.second);
+  }
+
+  if (sqlite3_exec(db_, sql_server_runtime, nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to create server_runtime table: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to create server_runtime table: " +
+                             error);
+  }
+
+  if (sqlite3_exec(db_, sql_server_runtime_init, nullptr, nullptr,
+                   &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to initialize server_runtime: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to initialize server_runtime: " + error);
+  }
+
+  int64_t now = NowSeconds();
+  int64_t runtime_last_seen = GetRuntimeLastSeen();
+  int64_t stale_cutoff =
+      runtime_last_seen > 0 ? std::min(runtime_last_seen, now) : 0;
+  bool recover_remote_sessions =
+      stale_cutoff > 0 &&
+      now - stale_cutoff <= kRemoteControlRecoveryWindowSeconds;
+
+  if (!recover_remote_sessions) {
+    if (sqlite3_exec(db_, "DELETE FROM remote_control_sessions;", nullptr,
+                     nullptr, &err_msg) != SQLITE_OK) {
+      std::string error = SqliteExecError(db_, err_msg);
+      LOG_ERROR("Failed to clear remote_control_sessions: {}", error);
+      sqlite3_free(err_msg);
+      throw std::runtime_error("Failed to clear remote_control_sessions: " +
+                               error);
+    }
+  } else {
+    LOG_INFO("Recovering persisted remote control sessions from last {}s",
+             now - stale_cutoff);
+  }
+
+  int64_t offline_time = stale_cutoff > 0 ? stale_cutoff : now;
+  std::string sql_presence_startup_reset =
+      "UPDATE device_presence SET "
+      "online = 0, "
+      "updated_at = " +
+      std::to_string(offline_time) +
+      ", "
+      "online_since = 0 "
+      "WHERE online = 1;";
+  if (sqlite3_exec(db_, sql_presence_startup_reset.c_str(), nullptr, nullptr,
+                   &err_msg) != SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to reset stale device presence: {}", error);
+    sqlite3_free(err_msg);
+    throw std::runtime_error("Failed to reset stale device presence: " +
+                             error);
+  }
+
+  if (!RecordRuntimeHeartbeat()) {
+    throw std::runtime_error("Failed to record runtime heartbeat");
+  }
+}
+
+bool DeviceDBManager::DeviceIdExists(const std::string& device_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr || device_id.empty()) {
+    return false;
+  }
+
+  const char* sql = "SELECT 1 FROM devices WHERE device_id = ? LIMIT 1;";
+  sqlite3_stmt* stmt = nullptr;
+
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  bool exists = (sqlite3_step(stmt) == SQLITE_ROW);
+  sqlite3_finalize(stmt);
+
+  return exists;
+}
+
+std::string DeviceDBManager::GenerateDeviceId() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in GenerateDeviceId.");
+    return {};
+  }
+
+  const int MIN_ID = 100000000;
+  const int MAX_ID = 999999999;
+  const int MAX_RETRIES = 100;
+
+  constexpr uint32_t range = MAX_ID - MIN_ID + 1;
+  constexpr uint32_t ceiling = UINT32_MAX - UINT32_MAX % range;
+
+  // try to generate unique ID
+  for (int attempt = 0; attempt < MAX_RETRIES; ++attempt) {
+    uint32_t random;
+    if (RAND_bytes(reinterpret_cast<unsigned char*>(&random), sizeof(random)) !=
+        1)
+      return {};
+    if (random >= ceiling) continue;
+    int obfuscated_id = MIN_ID + random % range;
+
+    char buf[10] = {0};
+    snprintf(buf, sizeof(buf), "%09d", obfuscated_id);
+    std::string device_id(buf);
+
+    // check if ID already exists
+    if (!DeviceIdExists(device_id)) {
+      return device_id;
+    }
+  }
+
+  LOG_ERROR("Failed to generate unique device ID after {} attempts.",
+            MAX_RETRIES);
+  return {};
+}
+
+DeviceCredential DeviceDBManager::AddDevice(const std::string& device_id,
+                                            const std::string& password) {
+  if (!device_id.empty() && !IsTemporaryControllerRegistration(device_id) &&
+      ReadPassword(device_id)) {
+    return VerifyDevice(device_id, password) == 0
+               ? DeviceCredential{device_id, "", false}
+               : DeviceCredential{};
+  }
+  const auto generated = DevicePassword::Generate();
+  if (generated.empty()) return {};
+  const auto record = DevicePassword::Hash(generated);
+  if (!record) return {};
+  return RegisterDevice(
+      IsTemporaryControllerRegistration(device_id) ? device_id : "", generated,
+      *record);
+}
+
+DeviceCredential DeviceDBManager::RegisterDevice(
+    const std::string& device_id, const std::string& password,
+    const DevicePasswordRecord& record, const std::string& login_public_key) {
+  if ((!device_id.empty() && !IsTemporaryControllerRegistration(device_id)) ||
+      password.empty() || !DevicePassword::IsCurrent(record) ||
+      (!login_public_key.empty() && (login_public_key.size() != 64 ||
+       !device_id.empty() || !std::all_of(login_public_key.begin(), login_public_key.end(),
+           [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))))
+    return {};
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (!db_) return {};
+  // Device not exists or device_id is empty — generate new
+  const int MAX_RETRIES = 10;
+  for (int i = 0; i < MAX_RETRIES; ++i) {
+    std::string new_id;
+    if (IsTemporaryControllerRegistration(device_id)) {
+      std::string generated_id = GenerateDeviceId();
+      if (generated_id.empty()) {
+        LOG_ERROR("Failed to generate temporary controller ID.");
+        return {};
+      }
+      new_id = device_id + "-" + generated_id;
+    } else {
+      new_id = GenerateDeviceId();
+      if (new_id.empty()) {
+        LOG_ERROR("Failed to generate device ID.");
+        return {};
+      }
+    }
+
+    // Check uniqueness including the temporary controller prefix.
+    if (DeviceIdExists(new_id)) {
+      LOG_WARN("Generated ID {} already exists, retrying...", new_id);
+      continue;
+    }
+
+    // Use transaction to reduce race condition
+    if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr) !=
+        SQLITE_OK)
+      return {};
+
+    // Double-check ID uniqueness within transaction
+    if (DeviceIdExists(new_id)) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_WARN("Generated ID {} already exists, retrying...", new_id);
+      continue;
+    }
+
+    const char* insert_sql =
+        "INSERT INTO devices (device_id, password_hash, password_salt, "
+        "retention_started_at, login_public_key) VALUES "
+        "(?, ?, ?, CAST(strftime('%s','now') AS INTEGER), ?);";
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_ERROR("Failed to prepare insert statement.");
+      return {};
+    }
+
+    sqlite3_bind_text(stmt, 1, new_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, record.hash.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, record.salt.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, login_public_key.c_str(), -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+
+    if (rc == SQLITE_DONE) {
+      if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr) !=
+          SQLITE_OK) {
+        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return {};
+      }
+      // Temporary controllers never receive a local password
+      if (IsTemporaryControllerRegistration(device_id)) {
+        return {new_id, "", false};
+      }
+      return {new_id, password, false};
+    } else if (rc == SQLITE_CONSTRAINT) {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_WARN(
+          "Insert failed due to constraint (ID may have been inserted "
+          "concurrently): {}",
+          new_id);
+      continue;
+    } else {
+      sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+      LOG_ERROR("Insert device failed: {}", sqlite3_errmsg(db_));
+      return {};
+    }
+  }
+
+  LOG_ERROR("Failed to generate unique device_id after {} attempts.",
+            MAX_RETRIES);
+  return {};
+}
+
+std::optional<DevicePasswordRecord> DeviceDBManager::ReadPassword(
+    const std::string& device_id) {
+  if (device_id.empty() || device_id.size() > 128 ||
+      device_id.find('\0') != std::string::npos)
+    return std::nullopt;
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (!db_) return std::nullopt;
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(
+          db_,
+          "SELECT password_salt,password_hash FROM devices WHERE device_id=?;",
+          -1, &stmt, nullptr) != SQLITE_OK)
+    return std::nullopt;
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  std::optional<DevicePasswordRecord> result;
+  if (sqlite3_step(stmt) == SQLITE_ROW)
+    result = DevicePasswordRecord{ColumnText(stmt, 0), ColumnText(stmt, 1)};
+  sqlite3_finalize(stmt);
+  return result;
+}
+
+std::optional<std::string> DeviceDBManager::ReadLoginPublicKey(
+    const std::string& device_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  sqlite3_stmt* stmt = nullptr;
+  if (!db_ || sqlite3_prepare_v2(db_,
+      "SELECT login_public_key FROM devices WHERE device_id=?;",
+      -1, &stmt, nullptr) != SQLITE_OK) return std::nullopt;
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  std::optional<std::string> key;
+  if (sqlite3_step(stmt) == SQLITE_ROW) key = ColumnText(stmt, 0);
+  sqlite3_finalize(stmt);
+  return key;
+}
+
+bool DeviceDBManager::BindLoginPublicKey(const std::string& device_id,
+                                        const DevicePasswordRecord& verified,
+                                        const std::string& public_key) {
+  if (public_key.size() != 64 || !std::all_of(public_key.begin(), public_key.end(),
+      [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }))
+    return false;
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  sqlite3_stmt* stmt = nullptr;
+  if (!db_ || sqlite3_prepare_v2(db_,
+      "UPDATE devices SET login_public_key=? WHERE device_id=? AND login_public_key='' "
+      "AND password_salt=? AND password_hash=?;",
+      -1, &stmt, nullptr) != SQLITE_OK) return false;
+  sqlite3_bind_text(stmt, 1, public_key.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 3, verified.salt.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 4, verified.hash.c_str(), -1, SQLITE_TRANSIENT);
+  const bool bound = sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+  sqlite3_finalize(stmt);
+  return bound;
+}
+
+bool DeviceDBManager::CommitPassword(const std::string& device_id,
+                                     const DevicePasswordRecord& expected,
+                                     const DevicePasswordRecord& replacement) {
+  if (!DevicePassword::IsCurrent(replacement)) return false;
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (!db_) return false;
+  // Recheck even when no migration is needed: a concurrent reset/deletion
+  // must invalidate work computed from an older snapshot.
+  const auto current = ReadPassword(device_id);
+  if (!current || !(*current == expected)) return false;
+  if (expected == replacement) return true;
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_,
+                         "UPDATE devices SET password_salt=?,password_hash=? "
+                         "WHERE device_id=? "
+                         "AND password_salt=? AND password_hash=?;",
+                         -1, &stmt, nullptr) != SQLITE_OK)
+    return false;
+  sqlite3_bind_text(stmt, 1, replacement.salt.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, replacement.hash.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 3, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 4, expected.salt.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 5, expected.hash.c_str(), -1, SQLITE_TRANSIENT);
+  const bool success =
+      sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db_) == 1;
+  sqlite3_finalize(stmt);
+  return success;
+}
+
+int DeviceDBManager::VerifyDevice(const std::string& device_id,
+                                  const std::string& password) {
+  const auto record = ReadPassword(device_id);
+  const auto verified = DevicePassword::Verify(record, password);
+  return record
+             ? (verified && CommitPassword(device_id, *record, *verified) ? 0
+                                                                          : -1)
+             : -2;
+}
+
+bool DeviceDBManager::UpdatePassword(const std::string& device_id,
+                                     const std::string& new_password) {
+  const auto record = ReadPassword(device_id);
+  if (!record) return false;
+  const auto replacement = DevicePassword::Hash(new_password);
+  return replacement && CommitPassword(device_id, *record, *replacement);
+}
+
+bool DeviceDBManager::RemoveDevice(const std::string& device_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in RemoveDevice.");
+    return false;
+  }
+
+  if (IsTemporaryControllerId(device_id)) {
+    try {
+      return !CleanupTemporaryControllers(1, device_id).device_ids.empty();
+    } catch (const std::exception& error) {
+      LOG_ERROR("Temporary controller cleanup failed: {}", error.what());
+      return false;
+    }
+  }
+
+  const char* sql = "DELETE FROM devices WHERE device_id = ?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  bool success = (sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  return success;
+}
+
+int64_t DeviceDBManager::GetRuntimeLastSeen() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in GetRuntimeLastSeen.");
+    return 0;
+  }
+
+  const char* sql = "SELECT last_seen_at FROM server_runtime WHERE id = 1;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return 0;
+  }
+
+  int64_t last_seen_at = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    last_seen_at = sqlite3_column_int64(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return last_seen_at;
+}
+
+bool DeviceDBManager::RecordRuntimeHeartbeat() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in RecordRuntimeHeartbeat.");
+    return false;
+  }
+
+  std::string now = std::to_string(NowSeconds());
+  std::string sql = "UPDATE server_runtime SET last_seen_at = " + now +
+                    " WHERE id = 1;";
+
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    std::string error = SqliteExecError(db_, err_msg);
+    LOG_ERROR("Failed to record runtime heartbeat: {}", error);
+    sqlite3_free(err_msg);
+    return false;
+  }
+  RefreshDailyControllerActivity(NowSeconds());
+  return true;
+}
+
+RetentionCleanupResult DeviceDBManager::CleanupExpiredDevices(
+    int retention_days, size_t batch_size) {
+  if (retention_days < 1 || retention_days > 3650 ||
+      batch_size < 1 || batch_size > 1000)
+    throw std::invalid_argument("Invalid device retention policy");
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  const int64_t cutoff = NowSeconds() - int64_t{retention_days} * 86400;
+  RetentionCleanupResult result;
+  ExecuteSchemaStatement(db_, "BEGIN IMMEDIATE;", "begin device cleanup");
+  sqlite3_stmt* stmt = nullptr;
+  try {
+    // Expire the base identity and its clone together, only after both have
+    // been offline for the full retention period. Sessions survive short
+    // restarts and must protect their identities even before they reconnect.
+    const char* candidates =
+        "WITH expired AS ("
+        "SELECT CASE WHEN substr(p.device_id,1,2) = 'C-' "
+        "THEN substr(p.device_id,3) ELSE p.device_id END AS device_id, "
+        "p.updated_at AS expired_at FROM device_presence p "
+        "WHERE p.online = 0 AND p.updated_at < ?1 "
+        "UNION ALL "
+        "SELECT CASE WHEN substr(d.device_id,1,2) = 'C-' "
+        "THEN substr(d.device_id,3) ELSE d.device_id END, "
+        "d.retention_started_at FROM devices d "
+        "WHERE d.retention_started_at < ?1 AND NOT EXISTS "
+        "(SELECT 1 FROM device_presence p WHERE p.device_id = d.device_id)) "
+        "SELECT e.device_id FROM expired e "
+        "WHERE NOT EXISTS (SELECT 1 FROM device_presence live "
+        "WHERE live.device_id IN (e.device_id, 'C-' || e.device_id) "
+        "AND (live.online != 0 OR live.updated_at >= ?1)) "
+        // An old clone alone cannot prove the age of a base credential whose
+        // own presence was removed by an older server or a history cleanup.
+        "AND NOT EXISTS (SELECT 1 FROM devices d "
+        "WHERE d.device_id IN (e.device_id, 'C-' || e.device_id) "
+        "AND d.retention_started_at >= ?1 AND NOT EXISTS "
+        "(SELECT 1 FROM device_presence p WHERE p.device_id = d.device_id)) "
+        "AND NOT EXISTS (SELECT 1 FROM remote_control_sessions s "
+        "WHERE s.normalized_host_id = e.device_id "
+        "OR s.normalized_guest_id = e.device_id) "
+        "GROUP BY e.device_id ORDER BY MIN(e.expired_at), e.device_id LIMIT ?2;";
+    if (sqlite3_prepare_v2(db_, candidates, -1, &stmt, nullptr) != SQLITE_OK)
+      throw std::runtime_error(sqlite3_errmsg(db_));
+    sqlite3_bind_int64(stmt, 1, cutoff);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(batch_size));
+    auto& ids = result.device_ids;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW)
+      ids.push_back(ColumnText(stmt, 0));
+    if (rc != SQLITE_DONE) throw std::runtime_error(sqlite3_errmsg(db_));
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
+
+    const char* remove_associations =
+        "DELETE FROM user_devices WHERE user_id IN (?1,?2) "
+        "OR device_id IN (?1,?2);";
+    const char* remove_presence =
+        "DELETE FROM device_presence WHERE device_id IN (?1,?2);";
+    const char* remove_credentials =
+        "DELETE FROM devices WHERE device_id IN (?1,?2);";
+    const char* remove_activity =
+        "DELETE FROM daily_controller_activity WHERE device_id IN (?1,?2);";
+    for (const auto& id : ids) {
+      const auto clone = "C-" + id;
+      for (const char* sql :
+           {remove_associations, remove_presence, remove_credentials, remove_activity}) {
+        if (sql == remove_activity && IsTemporaryControllerId(id)) continue;
+        if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK)
+          throw std::runtime_error(sqlite3_errmsg(db_));
+        sqlite3_bind_text(stmt, 1, id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, clone.c_str(), -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) != SQLITE_DONE)
+          throw std::runtime_error(sqlite3_errmsg(db_));
+        if (sql == remove_associations)
+          result.associations += sqlite3_changes(db_);
+        else if (sql == remove_presence)
+          result.devices += sqlite3_changes(db_);
+        else if (sql == remove_credentials)
+          result.credentials += sqlite3_changes(db_);
+        sqlite3_finalize(stmt);
+        stmt = nullptr;
+      }
+    }
+
+    // Also expire old associations whose owner has no presence row. Current
+    // subscriptions live in PresenceManager and are unaffected by this table.
+    const char* orphan_associations =
+        "DELETE FROM user_devices WHERE rowid IN ("
+        "SELECT a.rowid FROM user_devices a WHERE a.updated_at < ?1 "
+        "AND NOT EXISTS (SELECT 1 FROM device_presence p WHERE "
+        "p.device_id IN (CASE WHEN substr(a.user_id,1,2) = 'C-' "
+        "THEN substr(a.user_id,3) ELSE a.user_id END, 'C-' || "
+        "CASE WHEN substr(a.user_id,1,2) = 'C-' "
+        "THEN substr(a.user_id,3) ELSE a.user_id END) "
+        "AND (p.online != 0 OR p.updated_at >= ?1)) "
+        "AND NOT EXISTS (SELECT 1 FROM remote_control_sessions s WHERE "
+        "s.normalized_host_id = CASE WHEN substr(a.user_id,1,2) = 'C-' "
+        "THEN substr(a.user_id,3) ELSE a.user_id END "
+        "OR s.normalized_guest_id = CASE WHEN substr(a.user_id,1,2) = 'C-' "
+        "THEN substr(a.user_id,3) ELSE a.user_id END) "
+        "ORDER BY a.updated_at LIMIT ?2);";
+    if (sqlite3_prepare_v2(db_, orphan_associations, -1, &stmt, nullptr) != SQLITE_OK)
+      throw std::runtime_error(sqlite3_errmsg(db_));
+    sqlite3_bind_int64(stmt, 1, cutoff);
+    sqlite3_bind_int64(stmt, 2, static_cast<sqlite3_int64>(batch_size));
+    if (sqlite3_step(stmt) != SQLITE_DONE)
+      throw std::runtime_error(sqlite3_errmsg(db_));
+    const size_t orphan_count = sqlite3_changes(db_);
+    result.associations += orphan_count;
+    result.more = ids.size() == batch_size || orphan_count == batch_size;
+    sqlite3_finalize(stmt);
+    stmt = nullptr;
+    ExecuteSchemaStatement(db_, "COMMIT;", "commit device cleanup");
+  } catch (...) {
+    if (stmt) sqlite3_finalize(stmt);
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    throw;
+  }
+  if (result.devices || result.associations || result.credentials) {
+    // Does not wait for readers. Backups and snapshots have independent expiry.
+    sqlite3_wal_checkpoint_v2(db_, nullptr, SQLITE_CHECKPOINT_PASSIVE, nullptr, nullptr);
+  }
+  return result;
+}
+
+bool DeviceDBManager::SetDeviceOnline(const std::string& device_id,
+                                      bool online) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in SetDeviceOnline.");
+    return false;
+  }
+
+  const char* online_sql =
+      "INSERT INTO device_presence "
+      "(device_id, online, updated_at, online_since) "
+      "VALUES (?, 1, CAST(strftime('%s','now') AS INTEGER), "
+      "CAST(strftime('%s','now') AS INTEGER)) "
+      "ON CONFLICT(device_id) DO UPDATE SET "
+      "online=1, "
+      "updated_at=CAST(strftime('%s','now') AS INTEGER), "
+      "online_since=CASE "
+      "WHEN device_presence.online = 1 AND device_presence.online_since > 0 "
+      "THEN device_presence.online_since "
+      "ELSE CAST(strftime('%s','now') AS INTEGER) END;";
+
+  const char* offline_sql =
+      "INSERT INTO device_presence "
+      "(device_id, online, updated_at, online_since) "
+      "VALUES (?, 0, CAST(strftime('%s','now') AS INTEGER), 0) "
+      "ON CONFLICT(device_id) DO UPDATE SET "
+      "online=0, "
+      "updated_at=CAST(strftime('%s','now') AS INTEGER), "
+      "online_since=0;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, online ? online_sql : offline_sql, -1, &stmt,
+                         nullptr) != SQLITE_OK) {
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+bool DeviceDBManager::UpdateDeviceClientInfo(
+    const std::string& device_id, const std::string& client_version,
+    const std::string& client_platform) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in UpdateDeviceClientInfo.");
+    return false;
+  }
+  if (device_id.empty()) {
+    return false;
+  }
+  const std::string lower_platform = ToLower(client_platform);
+  const std::string platform =
+      lower_platform == "ios" || lower_platform == "android"
+          ? lower_platform
+          : client_platform;
+
+  const char* sql =
+      "INSERT INTO device_presence "
+      "(device_id, online, updated_at, client_version, client_platform) "
+      "VALUES (?, 0, CAST(strftime('%s','now') AS INTEGER), ?, ?) "
+      "ON CONFLICT(device_id) DO UPDATE SET "
+      "client_version=excluded.client_version, "
+      "client_platform=excluded.client_platform;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, client_version.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 3, platform.c_str(), -1, SQLITE_TRANSIENT);
+  const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+  sqlite3_finalize(stmt);
+  if (ok && !platform.empty()) UpdateDailyControllerKind(device_id, platform);
+  return ok;
+}
+
+bool DeviceDBManager::StartRemoteControlSession(
+    const std::string& transmission_id, const std::string& host_id,
+    const std::string& guest_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in StartRemoteControlSession.");
+    return false;
+  }
+  if (transmission_id.empty() || host_id.empty() || guest_id.empty() ||
+      host_id == guest_id) {
+    return false;
+  }
+
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    LOG_ERROR("Failed to begin StartRemoteControlSession transaction: {}",
+              err_msg ? err_msg : sqlite3_errmsg(db_));
+    sqlite3_free(err_msg);
+    return false;
+  }
+
+  auto rollback = [this]() {
+    char* rollback_err = nullptr;
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, &rollback_err);
+    sqlite3_free(rollback_err);
+  };
+
+  auto ensure_presence = [this](const std::string& device_id) {
+    const char* sql =
+        "INSERT INTO device_presence "
+        "(device_id, online, updated_at, online_since) "
+        "VALUES (?, 0, CAST(strftime('%s','now') AS INTEGER), 0) "
+        "ON CONFLICT(device_id) DO NOTHING;";
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+      return false;
+    }
+    sqlite3_bind_text(stmt, 1, device_id.c_str(), -1, SQLITE_TRANSIENT);
+    bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+  };
+
+  std::string normalized_host_id = NormalizeRemoteDeviceId(host_id);
+  std::string normalized_guest_id = NormalizeRemoteDeviceId(guest_id);
+  if (!ensure_presence(normalized_host_id) ||
+      !ensure_presence(normalized_guest_id)) {
+    rollback();
+    return false;
+  }
+
+  const char* sql =
+      "INSERT INTO remote_control_sessions "
+      "(transmission_id, guest_id, host_id, normalized_guest_id, "
+      "normalized_host_id, started_at, activity_confirmed) "
+      "VALUES (?, ?, ?, ?, ?, CAST(strftime('%s','now') AS INTEGER), 1) "
+      "ON CONFLICT(transmission_id, guest_id) DO UPDATE SET activity_confirmed=1;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    rollback();
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, transmission_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, guest_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 3, host_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 4, normalized_guest_id.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 5, normalized_host_id.c_str(), -1,
+                    SQLITE_TRANSIENT);
+  bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+  if (!ok) {
+    rollback();
+    return false;
+  }
+
+  try {
+    RecordDailyControllerActivity(NowSeconds(), transmission_id, guest_id);
+  } catch (const std::exception& error) {
+    rollback();
+    LOG_ERROR("Failed to record controller activity: {}", error.what());
+    return false;
+  }
+
+  if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    LOG_ERROR("Failed to commit StartRemoteControlSession transaction: {}",
+              err_msg ? err_msg : sqlite3_errmsg(db_));
+    sqlite3_free(err_msg);
+    rollback();
+    return false;
+  }
+  return true;
+}
+
+bool DeviceDBManager::EndRemoteControlSession(
+    const std::string& transmission_id, const std::string&,
+    const std::string& guest_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in EndRemoteControlSession.");
+    return false;
+  }
+  if (transmission_id.empty() || guest_id.empty()) {
+    return false;
+  }
+
+  // Include a connection ending just after midnight, before the next heartbeat.
+  // Restored sessions remain unconfirmed until a successful join/resume.
+  RecordDailyControllerActivity(NowSeconds(), transmission_id, guest_id);
+
+  const char* sql =
+      "DELETE FROM remote_control_sessions "
+      "WHERE transmission_id = ? AND guest_id = ?;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, transmission_id.c_str(), -1, SQLITE_TRANSIENT);
+  sqlite3_bind_text(stmt, 2, guest_id.c_str(), -1, SQLITE_TRANSIENT);
+  const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
+  sqlite3_finalize(stmt);
+  return ok;
+}
+
+bool DeviceDBManager::EndRemoteControlTransmission(
+    const std::string& transmission_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in EndRemoteControlTransmission.");
+    return false;
+  }
+  if (transmission_id.empty()) {
+    return false;
+  }
+
+  const char* sql =
+      "SELECT host_id, guest_id FROM remote_control_sessions "
+      "WHERE transmission_id = ?;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, transmission_id.c_str(), -1, SQLITE_TRANSIENT);
+
+  std::vector<std::pair<std::string, std::string>> sessions;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    sessions.push_back({ColumnText(stmt, 0), ColumnText(stmt, 1)});
+  }
+  sqlite3_finalize(stmt);
+
+  bool ok = true;
+  for (const auto& session : sessions) {
+    ok = EndRemoteControlSession(transmission_id, session.first,
+                                 session.second) &&
+         ok;
+  }
+  return ok;
+}
+
+int DeviceDBManager::CountActiveRemoteControlConnections() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR(
+        "Database is not initialized in CountActiveRemoteControlConnections.");
+    return 0;
+  }
+
+  const char* sql = "SELECT COUNT(*) FROM remote_control_sessions;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return 0;
+  }
+
+  int count = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    count = sqlite3_column_int(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return count;
+}
+
+int DeviceDBManager::CountRemoteControlTransmissions(
+    const std::string& search) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in CountRemoteControlTransmissions.");
+    return 0;
+  }
+
+  std::string sql =
+      "SELECT COUNT(*) FROM ("
+      "SELECT transmission_id, host_id FROM remote_control_sessions ";
+  if (!search.empty()) {
+    sql +=
+        "WHERE transmission_id LIKE ? ESCAPE '\\' "
+        "OR host_id LIKE ? ESCAPE '\\' "
+        "OR guest_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += "GROUP BY transmission_id, host_id);";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return 0;
+  }
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, pattern.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, pattern.c_str(), -1, SQLITE_TRANSIENT);
+  }
+
+  int count = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    count = sqlite3_column_int(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return count;
+}
+
+std::vector<RemoteControlSessionInfo>
+DeviceDBManager::ListRemoteControlSessions(size_t limit, size_t offset,
+                                           const std::string& search) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  std::vector<RemoteControlSessionInfo> result;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in ListRemoteControlSessions.");
+    return result;
+  }
+
+  std::string sql =
+      "SELECT transmission_id, host_id, MIN(started_at), "
+      "GROUP_CONCAT(guest_id) "
+      "FROM remote_control_sessions ";
+  if (!search.empty()) {
+    sql +=
+        "WHERE transmission_id LIKE ? ESCAPE '\\' "
+        "OR host_id LIKE ? ESCAPE '\\' "
+        "OR guest_id LIKE ? ESCAPE '\\' ";
+  }
+  sql +=
+      "GROUP BY transmission_id, host_id "
+      "ORDER BY MIN(started_at) DESC, transmission_id ASC "
+      "LIMIT ? OFFSET ?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return result;
+  }
+
+  int bind_index = 1;
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1,
+                      SQLITE_TRANSIENT);
+  }
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(limit));
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(offset));
+
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    RemoteControlSessionInfo info;
+    info.transmission_id = ColumnText(stmt, 0);
+    info.host_id = ColumnText(stmt, 1);
+    info.started_at = sqlite3_column_int64(stmt, 2);
+    info.guest_ids = SplitCommaSeparatedIds(ColumnText(stmt, 3));
+    result.push_back(info);
+  }
+  sqlite3_finalize(stmt);
+  return result;
+}
+
+int DeviceDBManager::GetOnlineDeviceCount() {
+  return CountOnlineDevices();
+}
+
+int DeviceDBManager::CountOnlineDevices(const std::string& search) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in CountOnlineDevices.");
+    return 0;
+  }
+
+  std::string sql =
+      "SELECT COUNT(*) FROM device_presence "
+      "WHERE online = 1 "
+      "AND device_id NOT LIKE 'web-%' "
+      "AND device_id NOT LIKE 'cli-%' AND device_id NOT LIKE 'C-%' ";
+  if (!search.empty()) {
+    sql += "AND device_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += ";";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return 0;
+  }
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, 1, pattern.c_str(), -1, SQLITE_TRANSIENT);
+  }
+
+  int count = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    count = sqlite3_column_int(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return count;
+}
+
+int DeviceDBManager::CountDevicePresence(const std::string& search,
+                                         const std::string& filter,
+                                         const std::string& kind,
+                                         const std::string& platform,
+                                         const std::string& version) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in CountDevicePresence.");
+    return 0;
+  }
+
+  std::string sql = "SELECT COUNT(*) FROM device_presence WHERE " +
+                    DevicePresenceFilterClause(filter, kind) +
+                    DeviceClientFilterClause(platform, version);
+  if (!search.empty()) {
+    sql += "AND device_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += ";";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return 0;
+  }
+  int bind_index = 1;
+  BindDeviceClientFilters(stmt, bind_index, platform, version);
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+  }
+
+  int count = 0;
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    count = sqlite3_column_int(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return count;
+}
+
+DevicePresenceCounts DeviceDBManager::CountDevicePresenceByFilters(
+    const std::string& search, const std::string& kind,
+    const std::string& platform, const std::string& version) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  DevicePresenceCounts counts;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in CountDevicePresenceByFilters.");
+    return counts;
+  }
+
+  const std::string kind_clause = DevicePresenceKindClause(kind);
+  std::string sql =
+      "SELECT "
+      "COALESCE(SUM(CASE WHEN " +
+      kind_clause +
+      "THEN 1 ELSE 0 END), 0), "
+      "COALESCE(SUM(CASE WHEN " +
+      kind_clause +
+      "AND online = 1 THEN 1 ELSE 0 END), 0), "
+      "COALESCE(SUM(CASE WHEN " +
+      kind_clause +
+      "AND online = 0 THEN 1 ELSE 0 END), 0), "
+      "COALESCE(SUM(CASE WHEN " +
+      kind_clause +
+      "AND EXISTS ("
+      "SELECT 1 FROM remote_control_sessions "
+      "WHERE normalized_host_id = device_presence.device_id) "
+      "THEN 1 ELSE 0 END), 0), "
+      "COALESCE(SUM(CASE WHEN device_id LIKE 'web-%' "
+      "THEN 1 ELSE 0 END), 0), "
+      "COALESCE(SUM(CASE WHEN device_id LIKE 'cli-%' "
+      "THEN 1 ELSE 0 END), 0) "
+      "FROM device_presence WHERE 1 = 1 " +
+      DeviceClientFilterClause(platform, version);
+  if (!search.empty()) {
+    sql += "AND device_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += ";";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return counts;
+  }
+  int bind_index = 1;
+  BindDeviceClientFilters(stmt, bind_index, platform, version);
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1, SQLITE_TRANSIENT);
+  }
+
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    counts.all = sqlite3_column_int64(stmt, 0);
+    counts.online = sqlite3_column_int64(stmt, 1);
+    counts.offline = sqlite3_column_int64(stmt, 2);
+    counts.active = sqlite3_column_int64(stmt, 3);
+    counts.web = sqlite3_column_int64(stmt, 4);
+    counts.cli = sqlite3_column_int64(stmt, 5);
+  }
+  sqlite3_finalize(stmt);
+  return counts;
+}
+
+DeviceClientFilterOptions DeviceDBManager::ListDeviceClientFilterOptions(
+    const std::string& kind) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  DeviceClientFilterOptions options;
+  if (db_ == nullptr) return options;
+
+  // Options cover the entire client category, independent of pagination and
+  // active filters, so a filter remains available even when no rows match.
+  const std::string sql =
+      "SELECT DISTINCT client_platform, client_version FROM device_presence WHERE " +
+      DevicePresenceKindClause(kind) + ";";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    return options;
+  }
+  std::set<std::string> platforms, versions;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const auto platform = ColumnText(stmt, 0);
+    const auto version = ColumnText(stmt, 1);
+    if (!platform.empty()) platforms.insert(platform);
+    if (!version.empty()) versions.insert(version);
+  }
+  sqlite3_finalize(stmt);
+  options.platforms.assign(platforms.begin(), platforms.end());
+  options.versions.assign(versions.begin(), versions.end());
+  return options;
+}
+
+OnlineDurationStats DeviceDBManager::GetOnlineDurationStats() {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  OnlineDurationStats stats;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in GetOnlineDurationStats.");
+    return stats;
+  }
+
+  std::string sql =
+      "SELECT "
+      "COALESCE(SUM(CASE WHEN online = 1 AND online_since > 0 THEN "
+      "MAX(0, CAST(strftime('%s','now') AS INTEGER) - online_since) "
+      "ELSE 0 END), 0) "
+      "FROM device_presence "
+      "WHERE device_id NOT LIKE 'web-%' "
+      "AND device_id NOT LIKE 'cli-%' AND device_id NOT LIKE 'C-%';";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return stats;
+  }
+
+  if (sqlite3_step(stmt) == SQLITE_ROW) {
+    stats.current_online_seconds = sqlite3_column_int64(stmt, 0);
+  }
+  sqlite3_finalize(stmt);
+  return stats;
+}
+
+std::vector<OnlineDeviceInfo> DeviceDBManager::ListOnlineDevices() {
+  return ListOnlineDevices(static_cast<size_t>(std::numeric_limits<int>::max()),
+                           0, "");
+}
+
+std::vector<OnlineDeviceInfo> DeviceDBManager::ListOnlineDevices(
+    size_t limit, size_t offset, const std::string& search) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  std::vector<OnlineDeviceInfo> result;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in ListOnlineDevices.");
+    return result;
+  }
+
+  std::string sql =
+      "SELECT device_id, online, updated_at, online_since, "
+      "CASE WHEN online = 1 AND online_since > 0 THEN "
+      "MAX(0, CAST(strftime('%s','now') AS INTEGER) - online_since) "
+      "ELSE 0 END AS online_duration_seconds, "
+      "client_version, client_platform "
+      "FROM device_presence "
+      "WHERE online = 1 "
+      "AND device_id NOT LIKE 'web-%' "
+      "AND device_id NOT LIKE 'cli-%' AND device_id NOT LIKE 'C-%' ";
+  if (!search.empty()) {
+    sql += "AND device_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += "ORDER BY updated_at DESC, device_id ASC LIMIT ? OFFSET ?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return result;
+  }
+  int bind_index = 1;
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1,
+                      SQLITE_TRANSIENT);
+  }
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(limit));
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(offset));
+
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    OnlineDeviceInfo info;
+    info.device_id = ColumnText(stmt, 0);
+    info.online = sqlite3_column_int(stmt, 1) != 0;
+    info.updated_at = sqlite3_column_int64(stmt, 2);
+    info.online_since = sqlite3_column_int64(stmt, 3);
+    info.online_duration_seconds = sqlite3_column_int64(stmt, 4);
+    info.client_version = ColumnText(stmt, 5);
+    info.client_platform = ColumnText(stmt, 6);
+    result.push_back(info);
+  }
+  sqlite3_finalize(stmt);
+
+  return result;
+}
+
+std::vector<OnlineDeviceInfo> DeviceDBManager::ListDevicePresence(
+    size_t limit, size_t offset, const std::string& search,
+    const std::string& filter, const std::string& sort,
+    const std::string& order, const std::string& kind,
+    const std::string& platform, const std::string& version) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  std::vector<OnlineDeviceInfo> result;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in ListDevicePresence.");
+    return result;
+  }
+
+  std::string sql =
+      "SELECT device_id, online, updated_at, online_since, "
+      "CASE WHEN online = 1 AND online_since > 0 THEN "
+      "MAX(0, CAST(strftime('%s','now') AS INTEGER) - online_since) "
+      "ELSE 0 END AS online_duration_seconds, "
+      "COALESCE(("
+      "SELECT SUM(MAX(0, CAST(strftime('%s','now') AS INTEGER) - started_at)) "
+      "FROM remote_control_sessions "
+      "WHERE normalized_guest_id = device_presence.device_id), 0) "
+      "AS current_control_seconds, "
+      "COALESCE(("
+      "SELECT SUM(MAX(0, CAST(strftime('%s','now') AS INTEGER) - started_at)) "
+      "FROM remote_control_sessions "
+      "WHERE normalized_host_id = device_presence.device_id), 0) "
+      "AS current_controlled_seconds, "
+      "COALESCE(("
+      "SELECT COUNT(*) FROM remote_control_sessions "
+      "WHERE normalized_guest_id = device_presence.device_id), 0) "
+      "AS active_control_count, "
+      "COALESCE(("
+      "SELECT COUNT(*) FROM remote_control_sessions "
+      "WHERE normalized_host_id = device_presence.device_id), 0) "
+      "AS active_controlled_count, "
+      "COALESCE(("
+      "SELECT GROUP_CONCAT(DISTINCT normalized_host_id) "
+      "FROM remote_control_sessions "
+      "WHERE normalized_guest_id = device_presence.device_id), '') "
+      "AS active_control_targets, "
+      "COALESCE(("
+      "SELECT GROUP_CONCAT(DISTINCT normalized_guest_id) "
+      "FROM remote_control_sessions "
+      "WHERE normalized_host_id = device_presence.device_id), '') "
+      "AS active_controlled_by, "
+      "client_version, client_platform "
+      "FROM device_presence "
+      "WHERE " +
+      DevicePresenceFilterClause(filter, kind) +
+      DeviceClientFilterClause(platform, version);
+  if (!search.empty()) {
+    sql += "AND device_id LIKE ? ESCAPE '\\' ";
+  }
+  sql += "ORDER BY " + DevicePresenceSortClause(sort, order) +
+         "LIMIT ? OFFSET ?;";
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) !=
+      SQLITE_OK) {
+    return result;
+  }
+  int bind_index = 1;
+  BindDeviceClientFilters(stmt, bind_index, platform, version);
+  if (!search.empty()) {
+    std::string pattern = "%" + EscapeLikePattern(search) + "%";
+    sqlite3_bind_text(stmt, bind_index++, pattern.c_str(), -1,
+                      SQLITE_TRANSIENT);
+  }
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(limit));
+  sqlite3_bind_int64(stmt, bind_index++, static_cast<sqlite3_int64>(offset));
+
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    OnlineDeviceInfo info;
+    info.device_id = ColumnText(stmt, 0);
+    info.online = sqlite3_column_int(stmt, 1) != 0;
+    info.updated_at = sqlite3_column_int64(stmt, 2);
+    info.online_since = sqlite3_column_int64(stmt, 3);
+    info.online_duration_seconds = sqlite3_column_int64(stmt, 4);
+    info.current_control_seconds = sqlite3_column_int64(stmt, 5);
+    info.current_controlled_seconds = sqlite3_column_int64(stmt, 6);
+    info.active_control_count = sqlite3_column_int64(stmt, 7);
+    info.active_controlled_count = sqlite3_column_int64(stmt, 8);
+    info.active_control_targets = SplitCommaSeparatedIds(ColumnText(stmt, 9));
+    info.active_controlled_by = SplitCommaSeparatedIds(ColumnText(stmt, 10));
+    info.client_version = ColumnText(stmt, 11);
+    info.client_platform = ColumnText(stmt, 12);
+    result.push_back(info);
+  }
+  sqlite3_finalize(stmt);
+
+  return result;
+}
+
+std::vector<std::pair<std::string, bool>> DeviceDBManager::BatchQueryOnline(
+    const std::vector<std::string>& device_ids) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  std::vector<std::pair<std::string, bool>> result;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in BatchQueryOnline.");
+    return result;
+  }
+  if (device_ids.empty()) {
+    return result;
+  }
+
+  std::stringstream ss;
+  ss << "SELECT device_id, online FROM device_presence WHERE device_id IN (";
+  for (size_t i = 0; i < device_ids.size(); ++i) {
+    ss << (i == 0 ? "?" : ",?");
+  }
+  ss << ");";
+  std::string sql = ss.str();
+
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
+    return result;
+  }
+  for (size_t i = 0; i < device_ids.size(); ++i) {
+    sqlite3_bind_text(stmt, static_cast<int>(i + 1), device_ids[i].c_str(), -1,
+                      SQLITE_TRANSIENT);
+  }
+
+  std::unordered_map<std::string, bool> map;
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    std::string id = ColumnText(stmt, 0);
+    int online = sqlite3_column_int(stmt, 1);
+    map[id] = (online != 0);
+  }
+  sqlite3_finalize(stmt);
+
+  for (const auto& id : device_ids) {
+    auto it = map.find(id);
+    bool online = (it != map.end()) ? it->second : false;
+    result.emplace_back(id, online);
+  }
+  return result;
+}
+
+bool DeviceDBManager::SetUserDevices(
+    const std::string& user_id, const std::vector<std::string>& device_ids) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in SetUserDevices.");
+    return false;
+  }
+
+  char* err_msg = nullptr;
+  if (sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg) !=
+      SQLITE_OK) {
+    LOG_ERROR("Failed to begin SetUserDevices transaction: {}",
+              err_msg ? err_msg : sqlite3_errmsg(db_));
+    sqlite3_free(err_msg);
+    return false;
+  }
+
+  const char* delete_sql = "DELETE FROM user_devices WHERE user_id = ?;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, delete_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return false;
+  }
+  sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+  bool ok = (sqlite3_step(stmt) == SQLITE_DONE);
+  sqlite3_finalize(stmt);
+
+  if (!ok) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return false;
+  }
+
+  const char* insert_sql =
+      "INSERT OR IGNORE INTO user_devices (user_id, device_id, updated_at) "
+      "VALUES (?, ?, CAST(strftime('%s','now') AS INTEGER));";
+  if (sqlite3_prepare_v2(db_, insert_sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return false;
+  }
+
+  for (const auto& device_id : device_ids) {
+    if (device_id.empty()) {
+      continue;
+    }
+    sqlite3_reset(stmt);
+    sqlite3_clear_bindings(stmt);
+    sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, device_id.c_str(), -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+      ok = false;
+      break;
+    }
+  }
+  sqlite3_finalize(stmt);
+
+  if (!ok) {
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return false;
+  }
+
+  if (sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg) != SQLITE_OK) {
+    LOG_ERROR("Failed to commit SetUserDevices transaction: {}",
+              err_msg ? err_msg : sqlite3_errmsg(db_));
+    sqlite3_free(err_msg);
+    sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+    return false;
+  }
+
+  return true;
+}
+
+std::vector<std::string> DeviceDBManager::GetUserDevices(
+    const std::string& user_id) {
+  std::lock_guard<std::recursive_mutex> lock(db_mutex_);
+  std::vector<std::string> result;
+  if (db_ == nullptr) {
+    LOG_ERROR("Database is not initialized in GetUserDevices.");
+    return result;
+  }
+
+  const char* sql =
+      "SELECT device_id FROM user_devices WHERE user_id = ? ORDER BY "
+      "device_id;";
+  sqlite3_stmt* stmt = nullptr;
+  if (sqlite3_prepare_v2(db_, sql, -1, &stmt, nullptr) != SQLITE_OK) {
+    return result;
+  }
+
+  sqlite3_bind_text(stmt, 1, user_id.c_str(), -1, SQLITE_TRANSIENT);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    result.push_back(ColumnText(stmt, 0));
+  }
+  sqlite3_finalize(stmt);
+
+  return result;
+}

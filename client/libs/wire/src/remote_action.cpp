@@ -1,0 +1,674 @@
+#include <remote_action.h>
+#include <display_resolution_preferences.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cmath>
+
+#include <nlohmann/json.hpp>
+
+namespace crossdesk {
+namespace {
+
+using json = nlohmann::json;
+
+json DisplayResolutionsJson(const std::vector<DisplayResolutionInfo>& displays) {
+  json result = json::array();
+  for (const auto& display : displays) {
+    json modes = json::array();
+    for (const auto& mode : display.modes)
+      modes.push_back({{"width", mode.width}, {"height", mode.height}});
+    result.push_back({{"display_id", display.display_id},
+                      {"display_key", display.display_key},
+                      {"width", display.current.width},
+                      {"height", display.current.height}, {"modes", modes}});
+  }
+  return result;
+}
+
+bool ReadInteger(const json& object, const char* key, int64_t min,
+                 int64_t max, int64_t& result) {
+  const auto& value = object.at(key);
+  if (!value.is_number_integer() ||
+      (value.is_number_unsigned() && value.get<uint64_t>() > uint64_t(max)))
+    return false;
+  result = value.get<int64_t>();
+  return result >= min && result <= max;
+}
+
+bool ReadResolution(const json& object, DisplayResolution& result) {
+  int64_t width = 0, height = 0;
+  if (!ReadInteger(object, "width", 1, 32768, width) ||
+      !ReadInteger(object, "height", 1, 32768, height)) return false;
+  result = {int(width), int(height)};
+  return true;
+}
+
+bool ReadDisplayKey(const json& object, int& id, std::string& key) {
+  int64_t index = 0;
+  if (!ReadInteger(object, "display_id", 0, kMaxResolutionDisplays - 1, index))
+    return false;
+  key = object.at("display_key").get<std::string>();
+  if (key.empty() || key.size() > 1024 || key.find('\0') != std::string::npos)
+    return false;
+  id = int(index);
+  return true;
+}
+
+bool ReadDisplayResolutions(const json& values,
+                            std::vector<DisplayResolutionInfo>& result) {
+  result.clear();
+  if (!values.is_array() || values.size() > kMaxResolutionDisplays) return false;
+  for (const auto& value : values) {
+    DisplayResolutionInfo display;
+    if (!ReadDisplayKey(value, display.display_id, display.display_key) ||
+        !ReadResolution(value, display.current)) return false;
+    if (std::any_of(result.begin(), result.end(), [&](const auto& existing) {
+          return existing.display_id == display.display_id;
+        })) return false;
+    const auto& modes = value.at("modes");
+    if (!modes.is_array() || modes.size() > kMaxDisplayResolutionModes) return false;
+    for (const auto& mode : modes) {
+      DisplayResolution parsed;
+      if (!ReadResolution(mode, parsed)) return false;
+      if (std::find(display.modes.begin(), display.modes.end(), parsed) ==
+          display.modes.end()) display.modes.push_back(parsed);
+    }
+    result.push_back(std::move(display));
+  }
+  return true;
+}
+
+void ResetHostInfo(HostInfo& info) {
+  info.host_name[0] = '\0';
+  info.host_name_size = 0;
+  info.app_version[0] = '\0';
+  info.platform = HostPlatform::Unknown;
+  info.display_list = nullptr;
+  info.display_num = 0;
+  info.left = nullptr;
+  info.top = nullptr;
+  info.right = nullptr;
+  info.bottom = nullptr;
+  info.supports_privacy_screen = false;
+  info.supports_video_settings = false;
+  info.supports_video_codec_status = false;
+  info.supports_text_input = false;
+  info.supports_deskhub_preview = false;
+  info.supports_deskhub_resolution = false;
+  info.supports_deskhub_fps15 = false;
+  info.supports_deskhub_bandwidth = false;
+  info.supports_file_browser = false;
+  info.supports_file_clipboard = false;
+  info.file_clipboard_version = 0;
+}
+
+void CopyHostName(HostInfo& info, const std::string& host_name) {
+  std::size_t size = std::min(
+      {host_name.size(), host_name.find('\0'), sizeof(info.host_name) - 1});
+  // Keep the fixed-size UTF-8 field from ending inside a multibyte character.
+  while (size > 0 && size < host_name.size() &&
+         (static_cast<unsigned char>(host_name[size]) & 0xC0) == 0x80) {
+    --size;
+  }
+  std::memcpy(info.host_name, host_name.data(), size);
+  info.host_name[size] = '\0';
+  info.host_name_size = size;
+}
+
+bool AllocateHostDisplays(HostInfo& info, std::size_t count) {
+  if (count == 0) return true;
+
+  info.display_list = static_cast<char**>(std::calloc(count, sizeof(char*)));
+  info.left = static_cast<int*>(std::malloc(count * sizeof(int)));
+  info.top = static_cast<int*>(std::malloc(count * sizeof(int)));
+  info.right = static_cast<int*>(std::malloc(count * sizeof(int)));
+  info.bottom = static_cast<int*>(std::malloc(count * sizeof(int)));
+  return info.display_list && info.left && info.top && info.right &&
+         info.bottom;
+}
+
+char* DuplicateString(const std::string& value) {
+  char* copy = static_cast<char*>(std::malloc(value.size() + 1));
+  if (copy == nullptr) return nullptr;
+  std::memcpy(copy, value.data(), value.size());
+  copy[value.size()] = '\0';
+  return copy;
+}
+
+}  // namespace
+
+bool ParseDisplayResolutionPreferences(
+    const std::string& text, std::vector<DisplayResolutionPreference>& result) {
+  return text.size() <= 65536 &&
+      ReadDisplayResolutionPreferences(json::parse(text, nullptr, false), result);
+}
+
+const char* HostPlatformName(HostPlatform platform) {
+  switch (platform) {
+    case HostPlatform::Windows: return "windows";
+    case HostPlatform::MacOS: return "macos";
+    case HostPlatform::Linux: return "linux";
+    case HostPlatform::IOS: return "ios";
+    case HostPlatform::Android: return "android";
+    case HostPlatform::HarmonyOS: return "harmonyos";
+    default: return "unknown";
+  }
+}
+
+HostPlatform ParseHostPlatform(const std::string& platform) {
+  if (platform == "windows") return HostPlatform::Windows;
+  if (platform == "macos") return HostPlatform::MacOS;
+  if (platform == "linux") return HostPlatform::Linux;
+  if (platform == "ios") return HostPlatform::IOS;
+  if (platform == "android") return HostPlatform::Android;
+  if (platform == "harmonyos") return HostPlatform::HarmonyOS;
+  return HostPlatform::Unknown;
+}
+
+RemoteAction MakeHostInformation(const std::string& host_name,
+                                 const std::vector<HostDisplay>& displays,
+                                 bool supports_privacy_screen,
+                                 const std::string& app_version,
+                                 HostPlatform platform) {
+  RemoteAction action{};
+  action.type = ControlType::host_infomation;
+  ResetHostInfo(action.i);
+
+  const std::size_t count = displays.size();
+  if (AllocateHostDisplays(action.i, count)) {
+    action.i.display_num = count;
+    for (std::size_t index = 0; index < count; ++index) {
+      const HostDisplay& display = displays[index];
+      action.i.display_list[index] = DuplicateString(display.name);
+      action.i.left[index] = display.left;
+      action.i.top[index] = display.top;
+      action.i.right[index] = display.right;
+      action.i.bottom[index] = display.bottom;
+    }
+  } else {
+    FreeRemoteAction(action);
+  }
+
+  action.i.supports_privacy_screen = supports_privacy_screen;
+  action.i.platform = platform;
+  CopyHostName(action.i, host_name);
+  // Never advertise a truncated version as a different, valid release.
+  if (app_version.size() < sizeof(action.i.app_version) &&
+      app_version.find('\0') == std::string::npos) {
+    std::memcpy(action.i.app_version, app_version.c_str(), app_version.size() + 1);
+  }
+  return action;
+}
+
+std::string RemoteAction::to_json() const { return ToJson(*this); }
+
+bool RemoteAction::from_json(const std::string& json_string) {
+  RemoteAction temporary{};
+  if (!FromJson(json_string, temporary)) return false;
+  *this = temporary;
+  return true;
+}
+
+std::string RemoteAction::ToJson(const RemoteAction& action) {
+  if (action.type == ControlType::invalid) return {};
+
+  json object;
+  object["type"] = action.type;
+  switch (action.type) {
+    case ControlType::mouse:
+      object["mouse"] = {{"x", action.m.x},
+                         {"y", action.m.y},
+                         {"s", action.m.s},
+                         {"flag", action.m.flag}};
+      break;
+    case ControlType::text_input:
+      if (action.text.empty() || action.text.size() > kMaxTextInputBytes ||
+          action.text.find('\0') != std::string::npos) return {};
+      object["text"] = action.text;
+      break;
+    case ControlType::keyboard:
+      object["keyboard"] = {{"key_value", action.k.key_value},
+                            {"scan_code", action.k.scan_code},
+                            {"extended", action.k.extended},
+                            {"flag", action.k.flag}};
+      break;
+    case ControlType::keyboard_state: {
+      json keys = json::array();
+      const std::size_t pressed_count =
+          std::min(action.ks.pressed_count, kMaxKeyboardStateKeys);
+      for (std::size_t index = 0; index < pressed_count; ++index) {
+        keys.push_back(
+            {{"key_value", action.ks.pressed_keys[index].key_value},
+             {"scan_code", action.ks.pressed_keys[index].scan_code},
+             {"extended", action.ks.pressed_keys[index].extended}});
+      }
+      object["keyboard_state"] =
+          {{"seq", action.ks.seq}, {"pressed_keys", keys}};
+      break;
+    }
+    case ControlType::cursor_state:
+      object["cursor_state"] =
+          {{"seq", action.cs.seq},
+           {"visible", action.cs.visible},
+           {"shape", static_cast<int>(action.cs.shape)},
+           {"position_valid", action.cs.position_valid},
+           {"x", action.cs.x},
+           {"y", action.cs.y},
+           {"visual_offset_x", action.cs.visual_offset_x},
+           {"visual_offset_y", action.cs.visual_offset_y},
+           {"display_id", action.cs.display_id},
+           {"position_update", action.cs.position_update},
+           {"render_mode", static_cast<int>(action.cs.render_mode)},
+           {"hidden_reason", static_cast<int>(action.cs.hidden_reason)}};
+      break;
+    case ControlType::video_codec_status:
+      object["video_codec"] = {{"encoder", action.vcs.encoder}};
+      break;
+    case ControlType::display_resolution:
+    case ControlType::display_resolution_status: {
+      const auto& change = action.resolution_change;
+      if (!ValidDisplayResolution(change.resolution) || change.request_id == 0 ||
+          change.display_id < 0 || change.display_id >= kMaxResolutionDisplays ||
+          change.display_key.empty() || change.display_key.size() > 1024 ||
+          change.display_key.find('\0') != std::string::npos) return {};
+      object["display_resolution"] = {
+          {"display_id", change.display_id}, {"display_key", change.display_key},
+          {"width", change.resolution.width}, {"height", change.resolution.height},
+          {"request_id", change.request_id}, {"accepted", change.accepted}};
+      if (action.type == ControlType::display_resolution_status)
+        object["display_resolutions"] = DisplayResolutionsJson(action.display_resolutions);
+      break;
+    }
+    case ControlType::video_settings:
+    case ControlType::video_settings_status:
+      if (!ValidVideoSettings(action.vs)) return {};
+      object["video_settings"] = {{"quality", action.vs.quality},
+                                  {"frame_rate", action.vs.frame_rate},
+                                  {"preference", action.vs.preference},
+                                  {"request_id", action.vs.request_id},
+                                  {"accepted", action.vs.accepted}};
+      break;
+    case ControlType::audio_capture:
+      object["audio_capture"] = action.a;
+      break;
+    case ControlType::display_id:
+      object["display_id"] = action.d;
+      break;
+    case ControlType::service_status:
+      object["service_status"] =
+          {{"available", action.ss.available},
+           {"interactive_stage", action.ss.interactive_stage}};
+      break;
+    case ControlType::service_command:
+      object["service_command"] = {{"flag", action.c.flag}};
+      break;
+    case ControlType::privacy_command:
+      object["privacy_command"] = {{"flag", action.pc.flag},
+                                   {"block_local_input", action.pc.block_local_input}};
+      break;
+    case ControlType::privacy_status:
+      object["privacy_status"] = {{"state", action.ps.state},
+          {"supported", action.ps.supported},
+          {"input_block_supported", action.ps.input_block_supported},
+          {"overlay_active", action.ps.overlay_active},
+          {"input_blocked", action.ps.input_blocked},
+          {"remote_paused", action.ps.remote_paused},
+          {"revision", action.ps.revision}, {"reason", action.ps.reason},
+          {"local_unlock_revision", action.ps.local_unlock_revision}};
+      break;
+    case ControlType::host_infomation: {
+      json displays = json::array();
+      for (std::size_t index = 0; index < action.i.display_num; ++index) {
+        displays.push_back(
+            {{"name", action.i.display_list ? action.i.display_list[index]
+                                             : ""},
+             {"left", action.i.left ? action.i.left[index] : 0},
+             {"top", action.i.top ? action.i.top[index] : 0},
+             {"right", action.i.right ? action.i.right[index] : 0},
+             {"bottom", action.i.bottom ? action.i.bottom[index] : 0}});
+      }
+      object["host_info"] = {
+          {"host_name", action.i.host_name},
+          {"app_version", action.i.app_version},
+          {"platform", HostPlatformName(action.i.platform)},
+          {"display_num", action.i.display_num},
+          {"displays", displays},
+          {"supports_privacy_screen", action.i.supports_privacy_screen},
+          {"supports_video_settings", action.i.supports_video_settings},
+          {"supports_video_codec_status", action.i.supports_video_codec_status},
+          {"supports_text_input", action.i.supports_text_input},
+          {"supports_deskhub_preview", action.i.supports_deskhub_preview},
+          {"supports_deskhub_resolution", action.i.supports_deskhub_resolution},
+          {"supports_deskhub_fps15", action.i.supports_deskhub_fps15},
+          {"supports_deskhub_bandwidth", action.i.supports_deskhub_bandwidth},
+          {"supports_file_browser", action.i.supports_file_browser},
+          {"supports_file_clipboard", action.i.supports_file_clipboard},
+          {"file_clipboard_version", action.i.file_clipboard_version}};
+      if (!action.display_resolutions.empty())
+        object["host_info"]["display_resolutions"] =
+            DisplayResolutionsJson(action.display_resolutions);
+      if (!action.preferred_display_resolutions.empty())
+        object["host_info"]["preferred_display_resolutions"] =
+            DisplayResolutionPreferencesJson(action.preferred_display_resolutions);
+      break;
+    }
+    case ControlType::invalid:
+    default:
+      return {};
+  }
+  return object.dump();
+}
+
+bool RemoteAction::FromJson(const std::string& json_string,
+                            RemoteAction& output) {
+  bool owns_host_info = false;
+  try {
+    const json object = json::parse(json_string);
+    output.display_resolutions.clear();
+    output.preferred_display_resolutions.clear();
+    output.type = static_cast<ControlType>(object.at("type").get<int>());
+    switch (output.type) {
+      case ControlType::display_resolution:
+      case ControlType::display_resolution_status: {
+        const auto& value = object.at("display_resolution");
+        auto& change = output.resolution_change;
+        int64_t request_id = 0;
+        if (!ReadDisplayKey(value, change.display_id, change.display_key) ||
+            !ReadResolution(value, change.resolution) ||
+            !ReadInteger(value, "request_id", 1, UINT32_MAX, request_id)) return false;
+        change.request_id = uint32_t(request_id);
+        change.accepted = false;
+        if (output.type == ControlType::display_resolution_status) {
+          change.accepted = value.at("accepted").get<bool>();
+          if (!ReadDisplayResolutions(object.at("display_resolutions"),
+                                       output.display_resolutions)) return false;
+        }
+        break;
+      }
+      case ControlType::mouse:
+        output.m.x = object.at("mouse").at("x").get<float>();
+        output.m.y = object.at("mouse").at("y").get<float>();
+        output.m.s = object.at("mouse").at("s").get<int>();
+        output.m.flag = static_cast<MouseFlag>(
+            object.at("mouse").at("flag").get<int>());
+        break;
+      case ControlType::text_input:
+        output.text = object.at("text").get<std::string>();
+        if (output.text.empty() || output.text.size() > kMaxTextInputBytes ||
+            output.text.find('\0') != std::string::npos) return false;
+        break;
+      case ControlType::keyboard:
+        output.k.key_value =
+            object.at("keyboard").at("key_value").get<std::size_t>();
+        output.k.scan_code = object.at("keyboard").value("scan_code", 0u);
+        output.k.extended = object.at("keyboard").value("extended", false);
+        output.k.flag = static_cast<KeyFlag>(
+            object.at("keyboard").at("flag").get<int>());
+        break;
+      case ControlType::keyboard_state: {
+        const auto& keyboard_state_object = object.at("keyboard_state");
+        output.ks.seq = keyboard_state_object.value("seq", 0u);
+        output.ks.pressed_count = 0;
+        const auto keys =
+            keyboard_state_object.value("pressed_keys", json::array());
+        if (!keys.is_array()) break;
+        const std::size_t count =
+            std::min(keys.size(), kMaxKeyboardStateKeys);
+        for (std::size_t index = 0; index < count; ++index) {
+          output.ks.pressed_keys[index].key_value =
+              keys[index].at("key_value").get<std::size_t>();
+          output.ks.pressed_keys[index].scan_code =
+              keys[index].value("scan_code", 0u);
+          output.ks.pressed_keys[index].extended =
+              keys[index].value("extended", false);
+        }
+        output.ks.pressed_count = count;
+        break;
+      }
+      case ControlType::cursor_state: {
+        const auto& cursor_state_object = object.at("cursor_state");
+        const int shape = cursor_state_object.at("shape").get<int>();
+        if (shape < static_cast<int>(RemoteCursorShape::default_cursor) ||
+            shape > static_cast<int>(RemoteCursorShape::nwse_resize)) {
+          return false;
+        }
+        output.cs.seq = cursor_state_object.at("seq").get<uint32_t>();
+        output.cs.visible = cursor_state_object.at("visible").get<bool>();
+        output.cs.shape = static_cast<RemoteCursorShape>(shape);
+        const int mode = cursor_state_object.value("render_mode", 0);
+        const int reason = cursor_state_object.value("hidden_reason", 0);
+        // Unknown extensions from a newer peer fall back to visible/shape.
+        output.cs.render_mode =
+            mode >= 0 && mode <= static_cast<int>(CursorRenderMode::unknown)
+                ? static_cast<CursorRenderMode>(mode)
+                : CursorRenderMode::legacy;
+        output.cs.hidden_reason =
+            reason >= 0 &&
+                    reason <= static_cast<int>(
+                                  CursorHiddenReason::secure_desktop_pending)
+                ? static_cast<CursorHiddenReason>(reason)
+                : CursorHiddenReason::unspecified;
+        output.cs.position_valid =
+            cursor_state_object.value("position_valid", false);
+        output.cs.x = cursor_state_object.value("x", 0.5f);
+        output.cs.y = cursor_state_object.value("y", 0.5f);
+        output.cs.visual_offset_x =
+            cursor_state_object.value("visual_offset_x", 0.0f);
+        output.cs.visual_offset_y =
+            cursor_state_object.value("visual_offset_y", 0.0f);
+        output.cs.display_id = cursor_state_object.value("display_id", -1);
+        // Cursor state messages predating position-only echo suppression
+        // always carried an authoritative position update.
+        output.cs.position_update =
+            cursor_state_object.value("position_update", true);
+        if (!std::isfinite(output.cs.x) || !std::isfinite(output.cs.y) ||
+            !std::isfinite(output.cs.visual_offset_x) ||
+            !std::isfinite(output.cs.visual_offset_y)) {
+          return false;
+        }
+        output.cs.x = std::clamp(output.cs.x, 0.0f, 1.0f);
+        output.cs.y = std::clamp(output.cs.y, 0.0f, 1.0f);
+        output.cs.visual_offset_x =
+            std::clamp(output.cs.visual_offset_x, -1.0f, 1.0f);
+        output.cs.visual_offset_y =
+            std::clamp(output.cs.visual_offset_y, -1.0f, 1.0f);
+        break;
+      }
+      case ControlType::video_codec_status: {
+        const auto encoder = object.at("video_codec").at("encoder").get<std::string>();
+        if (encoder.size() >= sizeof(output.vcs.encoder) ||
+            std::any_of(encoder.begin(), encoder.end(), [](unsigned char c) {
+              return c < 32 || c > 126;
+            })) return false;
+        std::memcpy(output.vcs.encoder, encoder.c_str(), encoder.size() + 1);
+        break;
+      }
+      case ControlType::video_settings:
+      case ControlType::video_settings_status: {
+        const auto& settings = object.at("video_settings");
+        for (const auto* field : {"quality", "frame_rate", "preference"}) {
+          if (!settings.at(field).is_number_integer()) return false;
+          const auto value = settings.at(field).get<int64_t>();
+          if (value < 0 || value > 60) return false;
+        }
+        output.vs = {settings.at("quality").get<int>(),
+                     settings.at("frame_rate").get<int>(),
+                     settings.at("preference").get<int>()};
+        if (!ValidVideoSettings(output.vs)) return false;
+        const auto& request_id = settings.at("request_id");
+        if (!request_id.is_number_integer() || request_id.get<int64_t>() < 0 ||
+            request_id.get<uint64_t>() > UINT32_MAX)
+          return false;
+        output.vs.request_id = request_id.get<uint32_t>();
+        output.vs.accepted = settings.value("accepted", false);
+        break;
+      }
+      case ControlType::audio_capture:
+        output.a = object.at("audio_capture").get<bool>();
+        break;
+      case ControlType::display_id:
+        output.d = object.at("display_id").get<int>();
+        break;
+      case ControlType::service_status: {
+        const auto& service_status_object = object.at("service_status");
+        output.ss.available = service_status_object.value("available", false);
+        const std::string stage = service_status_object.value(
+            "interactive_stage", std::string());
+        std::strncpy(output.ss.interactive_stage, stage.c_str(),
+                     sizeof(output.ss.interactive_stage) - 1);
+        output.ss.interactive_stage[sizeof(output.ss.interactive_stage) - 1] =
+            '\0';
+        break;
+      }
+      case ControlType::service_command:
+        output.c.flag = static_cast<ServiceCommandFlag>(
+            object.at("service_command").at("flag").get<int>());
+        break;
+      case ControlType::privacy_command: {
+        const auto& command = object.at("privacy_command");
+        const int flag = command.at("flag").get<int>();
+        if (flag < 0 || flag > 3) return false;
+        output.pc.flag = static_cast<PrivacyCommandFlag>(flag);
+        output.pc.block_local_input = command.at("block_local_input").get<bool>();
+        break;
+      }
+      case ControlType::privacy_status: {
+        const auto& status = object.at("privacy_status");
+        const int state = status.at("state").get<int>();
+        const auto reason = status.at("reason").get<std::string>();
+        if (state < 0 || state > 5 || reason.size() >= sizeof(output.ps.reason) ||
+            reason.find('\0') != std::string::npos) return false;
+        output.ps.state = static_cast<PrivacyState>(state);
+        output.ps.supported = status.at("supported").get<bool>();
+        output.ps.input_block_supported = status.at("input_block_supported").get<bool>();
+        output.ps.overlay_active = status.at("overlay_active").get<bool>();
+        output.ps.input_blocked = status.at("input_blocked").get<bool>();
+        output.ps.remote_paused = status.at("remote_paused").get<bool>();
+        output.ps.revision = status.at("revision").get<uint32_t>();
+        output.ps.local_unlock_revision = 0;
+        if (const auto event = status.find("local_unlock_revision"); event != status.end()) {
+          if (!event->is_number_integer() || event->get<int64_t>() < 0 ||
+              event->get<uint64_t>() > UINT32_MAX) return false;
+          output.ps.local_unlock_revision = event->get<uint32_t>();
+        }
+        std::memcpy(output.ps.reason, reason.c_str(), reason.size() + 1);
+        // Never render a contradictory success from a malformed peer.
+        if (output.ps.state == PrivacyState::on &&
+            (!output.ps.supported || !output.ps.overlay_active || output.ps.remote_paused)) return false;
+        break;
+      }
+      case ControlType::host_infomation: {
+        ResetHostInfo(output.i);
+        owns_host_info = true;
+        const auto& host_info_object = object.at("host_info");
+        // A corrupt optional preference must not prevent a connection.
+        if (const auto preferences = host_info_object.find("preferred_display_resolutions");
+            preferences != host_info_object.end())
+          ReadDisplayResolutionPreferences(*preferences,
+                                           output.preferred_display_resolutions);
+        if (const auto modes = host_info_object.find("display_resolutions");
+            modes != host_info_object.end() &&
+            !ReadDisplayResolutions(*modes, output.display_resolutions)) return false;
+        const auto platform = host_info_object.find("platform");
+        if (platform != host_info_object.end() && platform->is_string()) {
+          output.i.platform =
+              ParseHostPlatform(platform->get_ref<const std::string&>());
+        }
+        const auto app_version = host_info_object.find("app_version");
+        if (app_version != host_info_object.end() && app_version->is_string()) {
+          const auto& version = app_version->get_ref<const std::string&>();
+          if (version.size() < sizeof(output.i.app_version) &&
+              version.find('\0') == std::string::npos) {
+            std::memcpy(output.i.app_version, version.c_str(), version.size() + 1);
+          }
+        }
+        const auto privacy_support =
+            host_info_object.find("supports_privacy_screen");
+        output.i.supports_privacy_screen =
+            privacy_support != host_info_object.end() &&
+            privacy_support->is_boolean() && privacy_support->get<bool>();
+        output.i.supports_text_input =
+            host_info_object.value("supports_text_input", false);
+        output.i.supports_video_settings =
+            host_info_object.value("supports_video_settings", false);
+        output.i.supports_video_codec_status =
+            host_info_object.value("supports_video_codec_status", false);
+        output.i.supports_deskhub_preview =
+            host_info_object.value("supports_deskhub_preview", false);
+        output.i.supports_deskhub_resolution =
+            host_info_object.value("supports_deskhub_resolution", false);
+        output.i.supports_deskhub_fps15 =
+            host_info_object.value("supports_deskhub_fps15", false);
+        output.i.supports_deskhub_bandwidth =
+            host_info_object.value("supports_deskhub_bandwidth", false);
+        output.i.supports_file_browser =
+            host_info_object.value("supports_file_browser", false);
+        output.i.supports_file_clipboard =
+            host_info_object.value("supports_file_clipboard", false);
+        output.i.file_clipboard_version = host_info_object.value("file_clipboard_version", 0);
+        const std::string host_name =
+            host_info_object.at("host_name").get<std::string>();
+        CopyHostName(output.i, host_name);
+
+        const auto& displays = host_info_object.at("displays");
+        if (!displays.is_array()) return false;
+        output.i.display_num =
+            host_info_object.at("display_num").get<std::size_t>();
+        if (output.i.display_num != displays.size()) return false;
+        if (!AllocateHostDisplays(output.i, output.i.display_num)) {
+          FreeRemoteAction(output);
+          return false;
+        }
+
+        for (std::size_t index = 0; index < output.i.display_num; ++index) {
+          const std::string name =
+              displays[index].at("name").get<std::string>();
+          output.i.display_list[index] =
+              static_cast<char*>(std::malloc(name.size() + 1));
+          if (!output.i.display_list[index]) {
+            FreeRemoteAction(output);
+            return false;
+          }
+          std::memcpy(output.i.display_list[index], name.c_str(),
+                      name.size() + 1);
+          output.i.left[index] = displays[index].at("left").get<int>();
+          output.i.top[index] = displays[index].at("top").get<int>();
+          output.i.right[index] = displays[index].at("right").get<int>();
+          output.i.bottom[index] = displays[index].at("bottom").get<int>();
+        }
+        break;
+      }
+      default:
+        return false;
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    if (owns_host_info) {
+      FreeRemoteAction(output);
+    }
+    std::fprintf(stderr, "Failed to parse RemoteAction JSON: %s\n",
+                 exception.what());
+    return false;
+  }
+}
+
+void FreeRemoteAction(RemoteAction& action) {
+  if (action.type != ControlType::host_infomation) return;
+
+  if (action.i.display_list) {
+    for (std::size_t index = 0; index < action.i.display_num; ++index) {
+      std::free(action.i.display_list[index]);
+    }
+  }
+  std::free(action.i.display_list);
+  std::free(action.i.left);
+  std::free(action.i.top);
+  std::free(action.i.right);
+  std::free(action.i.bottom);
+  ResetHostInfo(action.i);
+}
+
+}  // namespace crossdesk

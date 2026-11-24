@@ -1,0 +1,61 @@
+import { UiRadius } from "ui_radius.slint";
+import { IconButton, FontAwesomeIcons } from "common.slint";
+import { GalleryStrings } from "device_strings.slint";
+
+export global DeviceCardStyle {
+    out property <length> toolbar-width: 104px;
+    out property <color> offline-preview: #626870;
+    out property <color> offline-background: #e4e6e9;
+    out property <color> offline-border: #c9cdd2;
+    out property <color> offline-text: #68707a;
+    out property <color> offline-placeholder: #eceef1;
+}
+
+component CardAction inherits IconButton {
+    width: 26px; height: 23px;
+    border-radius: UiRadius.control;
+    icon-size: 12px; icon-color: white;
+    hover-background: #ffffff2e;
+    pressed-background: #598cf273;
+    tooltip-above: true;
+}
+
+// Shared by recent connections and DeskHub; callers supply only behavior.
+export component DeviceCardActions inherits Rectangle {
+    in property <string> remove-label;
+    in property <bool> connected: false;
+    callback edit-alias();
+    callback edit-groups();
+    callback remove-device();
+    callback connect-device();
+    callback disconnect-device();
+    width: DeviceCardStyle.toolbar-width; height: 23px;
+    background: #4a4e55dc; border-radius: UiRadius.control;
+    HorizontalLayout {
+        spacing: 0px;
+        CardAction {
+            icon: FontAwesomeIcons.pen;
+            tooltip: GalleryStrings.texts[35];
+            clicked => { root.edit-alias(); }
+        }
+        CardAction {
+            icon: FontAwesomeIcons.tags;
+            tooltip: GalleryStrings.texts[30];
+            clicked => { root.edit-groups(); }
+        }
+        CardAction {
+            icon: FontAwesomeIcons.trash-can;
+            tooltip: root.remove-label;
+            clicked => { root.remove-device(); }
+        }
+        CardAction {
+            icon: root.connected ? FontAwesomeIcons.xmark : FontAwesomeIcons.arrow-right-long;
+            icon-size: 13px;
+            tooltip: root.connected ? GalleryStrings.texts[36] : GalleryStrings.texts[37];
+            clicked => {
+                if root.connected { root.disconnect-device(); }
+                else { root.connect-device(); }
+            }
+        }
+    }
+}

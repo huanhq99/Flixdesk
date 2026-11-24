@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="light">
+    <title>CrossDesk Admin</title>
+    <link rel="icon" type="image/png" href="/admin/assets/crossdesk-logo.png">
+    <link rel="stylesheet" href="/admin/assets/admin.css?v={{SERVER_VERSION}}">
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content" data-i18n="Skip to content">Skip to content</a>
+    <header class="app-header">
+      <div class="header-inner">
+        <div class="brand">
+          <img class="brand-mark" src="/admin/assets/crossdesk-logo.png" alt="" width="38" height="38">
+          <div>
+            <span class="brand-name">CrossDesk</span>
+            <span class="brand-caption" data-i18n="Administration">Administration</span>
+          </div>
+          <span id="server-version" class="server-version">{{SERVER_VERSION}}</span>
+        </div>
+        <nav id="dashboard-nav" class="header-nav hidden" aria-label="Main navigation" data-i18n-aria-label="Main navigation">
+          <a href="/admin/overview" data-page-link="overview" data-i18n="Overview">Overview</a>
+          <a href="/admin/data" data-page-link="data" data-i18n="Data management">Data management</a>
+          <a href="/admin/risk" data-page-link="risk" data-i18n="Risk controls">Risk controls</a>
+          <a href="/admin/announcements" data-page-link="announcements" data-i18n="Announcements">Announcements</a>
+          <a href="/admin/about" data-page-link="about" data-i18n="About">About</a>
+        </nav>
+        <div class="header-actions">
+          <select id="language" aria-label="Language" data-i18n-aria-label="Language">
+            <option value="zh">中文</option>
+            <option value="en">English</option>
+          </select>
+          <button id="logout" class="hidden" data-i18n="Logout">Logout</button>
+        </div>
+      </div>
+    </header>
+    <main id="main-content" tabindex="-1">
+      <section id="auth-loading" class="auth-loading" role="status">
+        <span class="loading-spinner" aria-hidden="true"></span>
+        <span data-i18n="Loading console…">Loading console…</span>
+      </section>
+      <section id="login-view" class="login hidden" aria-labelledby="login-title">
+        <form id="login-form" class="panel login-card">
+          <div>
+            <h1 id="login-title" data-i18n="Admin Login">Admin Login</h1>
+            <p class="section-description" data-i18n="Sign in with your server administrator account.">Sign in with your server administrator account.</p>
+          </div>
+          <label for="username" data-i18n="Username">Username</label>
+          <input id="username" autocomplete="username" placeholder="Username" data-i18n-placeholder="Username" required>
+          <label for="password" data-i18n="Password">Password</label>
+          <input id="password" autocomplete="current-password" placeholder="Password" data-i18n-placeholder="Password" type="password" required>
+          <div id="login-error" class="error" role="alert"></div>
+          <button id="login-submit" class="primary" type="submit" data-i18n="Login">Login</button>
+        </form>
+      </section>
+      <section id="dashboard-view" class="hidden">
+        <section class="hidden" data-page="announcements" aria-labelledby="announcements-title">
+          <div class="page-heading">
+            <h1 id="announcements-title" data-i18n="Announcements">Announcements</h1>
+            <button id="announcement-new" type="button" data-i18n="New announcement">New announcement</button>
+          </div>
+          <p class="section-description" data-i18n="Published announcements reach all clients. Editing or republishing makes them unread again.">Published announcements reach all clients. Editing or republishing makes them unread again.</p>
+          <div class="announcement-layout">
+            <div class="panel announcement-list-panel">
+              <div id="announcement-list"></div>
+              <div class="announcement-actions">
+                <button id="announcement-prev" type="button" data-i18n="Previous">Previous</button>
+                <span id="announcement-page"></span>
+                <button id="announcement-next" type="button" data-i18n="Next">Next</button>
+                <button id="announcement-refresh" type="button" data-i18n="Refresh">Refresh</button>
+              </div>
+            </div>
+            <form id="announcement-form" class="panel announcement-editor">
+              <h2 id="announcement-editor-heading" data-i18n="New announcement">New announcement</h2>
+              <label for="announcement-title" data-i18n="Title">Title</label>
+              <input id="announcement-title" maxlength="240" required>
+              <label for="announcement-body" data-i18n="Content">Content</label>
+              <textarea id="announcement-body" rows="12" maxlength="8000" required></textarea>
+              <p class="section-description" data-i18n="Plain text. Title up to 240 UTF-8 bytes; content up to 8000 bytes.">Plain text. Title up to 240 UTF-8 bytes; content up to 8000 bytes.</p>
+              <div class="announcement-actions">
+                <button type="submit" name="action" value="publish" class="primary" data-i18n="Publish">Publish</button>
+                <button type="submit" name="action" value="draft" id="announcement-draft" data-i18n="Save draft">Save draft</button>
+                <button type="button" id="announcement-delete" class="danger hidden" data-i18n="Delete announcement">Delete announcement</button>
+              </div>
+              <p id="announcement-status" role="status"></p>
+              <p id="announcement-error" class="error" role="alert"></p>
+            </form>
+          </div>
+        </section>
+        <div id="dashboard-error" class="error refresh-error" role="alert"></div>
+        <section id="overview" class="hidden" data-page="overview" aria-labelledby="overview-title">
+          <div class="page-heading">
+            <div>
+              <h1 id="overview-title" data-i18n="Overview">Overview</h1>
+            </div>
+            <div class="refresh-controls">
+              <div class="refresh-meta">
+                <span id="refresh-status" class="refresh-status" role="status" data-i18n="Auto-refresh · 5s">Auto-refresh · 5s</span>
+                <span class="last-refresh">
+                  <span data-i18n="Last refresh:">Last refresh:</span>
+                  <time id="last-refresh">—</time>
+                </span>
+              </div>
+              <button id="list-refresh" type="button" class="refresh-button">
+                <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M20 7v5h-5M4 17v-5h5"/>
+                  <path d="M6 6a8 8 0 0 1 13 3M18 18A8 8 0 0 1 5 15"/>
+                </svg>
+                <span data-i18n="Refresh lists">Refresh lists</span>
+              </button>
+            </div>
+          </div>
+          <div id="refresh-error" class="error refresh-error" role="alert"></div>
+          <div class="metrics-heading">
+            <h2 data-i18n="Client overview">Client overview</h2>
+            <span class="metrics-timezone" data-i18n="Beijing time · resets at 00:00">Beijing time · resets at 00:00</span>
+            <details class="metrics-help">
+              <summary data-i18n="Counting rules">Counting rules</summary>
+              <div class="metrics-help-content">
+                <p data-i18n="Daily activity counts controllers that successfully joined a remote session, including connections continuing past midnight. Merely being online does not count.">Daily activity counts controllers that successfully joined a remote session, including connections continuing past midnight. Merely being online does not count.</p>
+                <p data-i18n="PC and mobile controllers count once per device per day. Web and CLI controllers count once per temporary ID; obtaining a new ID can count again. These are client counts, not unique people.">PC and mobile controllers count once per device per day. Web and CLI controllers count once per temporary ID; obtaining a new ID can count again. These are client counts, not unique people.</p>
+                <p data-i18n="Disconnecting does not remove daily activity. Unavailable history is shown as —; collection-day totals are partial. Today and yesterday are retained.">Disconnecting does not remove daily activity. Unavailable history is shown as —; collection-day totals are partial. Today and yesterday are retained.</p>
+              </div>
+            </details>
+          </div>
+          <div class="metrics">
+            <article class="metric">
+              <h3 data-i18n="PC clients">PC clients</h3>
+              <dl class="metric-values">
+                <div class="metric-online"><dt data-i18n="Online now">Online now</dt><dd id="metric-devices">—</dd></div>
+                <div><dt data-i18n="Active today">Active today</dt><dd id="metric-pc-today">—</dd></div>
+                <div class="metric-yesterday"><dt data-i18n="Active yesterday">Active yesterday</dt><dd id="metric-pc-yesterday">—</dd></div>
+              </dl>
+            </article>
+            <article class="metric">
+              <h3 data-i18n="Mobile clients">Mobile clients</h3>
+              <dl class="metric-values">
+                <div class="metric-online"><dt data-i18n="Online now">Online now</dt><dd id="metric-mobile">—</dd></div>
+                <div><dt data-i18n="Active today">Active today</dt><dd id="metric-mobile-today">—</dd></div>
+                <div class="metric-yesterday"><dt data-i18n="Active yesterday">Active yesterday</dt><dd id="metric-mobile-yesterday">—</dd></div>
+              </dl>
+            </article>
+            <article class="metric">
+              <h3 data-i18n="Web clients">Web clients</h3>
+              <dl class="metric-values">
+                <div class="metric-online"><dt data-i18n="Online now">Online now</dt><dd id="metric-web">—</dd></div>
+                <div><dt data-i18n="Active today">Active today</dt><dd id="metric-web-today">—</dd></div>
+                <div class="metric-yesterday"><dt data-i18n="Active yesterday">Active yesterday</dt><dd id="metric-web-yesterday">—</dd></div>
+              </dl>
+            </article>
+            <article class="metric">
+              <h3 data-i18n="CLI clients">CLI clients</h3>
+              <dl class="metric-values">
+                <div class="metric-online"><dt data-i18n="Online now">Online now</dt><dd id="metric-cli">—</dd></div>
+                <div><dt data-i18n="Active today">Active today</dt><dd id="metric-cli-today">—</dd></div>
+                <div class="metric-yesterday"><dt data-i18n="Active yesterday">Active yesterday</dt><dd id="metric-cli-yesterday">—</dd></div>
+              </dl>
+            </article>
+            <article class="metric metric-session">
+              <h3 data-i18n="Active sessions">Active sessions</h3>
+              <dl class="metric-values">
+                <div><dt data-i18n="Current connections">Current connections</dt><dd id="metric-sessions">—</dd></div>
+              </dl>
+              <span id="recovery-count" class="hidden" role="status"></span>
+            </article>
+          </div>
+          <p id="daily-coverage" class="daily-coverage hidden" role="status"></p>
+          <div class="monitoring-grid">
+            <section id="clients" class="panel presence-panel" aria-labelledby="clients-title">
+              <div class="section-heading">
+                <h2 id="clients-title" data-i18n="Client Presence">Client Presence</h2>
+                <div class="segments" id="device-filters" role="group" aria-label="Device filters" data-i18n-aria-label="Device filters">
+                  <button type="button" data-device-filter="online">
+                    <span data-i18n="Online">Online</span>
+                    <span id="device-count-online">0</span>
+                  </button>
+                  <button type="button" data-device-filter="active" title="Devices currently being controlled; each device is counted once" data-i18n-title="Devices currently being controlled; each device is counted once">
+                    <span data-i18n="Controlled">Controlled</span>
+                    <span id="device-count-active">0</span>
+                  </button>
+                  <button type="button" data-device-filter="offline">
+                    <span data-i18n="Offline">Offline</span>
+                    <span id="device-count-offline">0</span>
+                  </button>
+                  <button type="button" data-device-filter="all">
+                    <span data-i18n="All">All</span>
+                    <span id="device-count-all">0</span>
+                  </button>
+                </div>
+              </div>
+              <div class="filter-toolbar" id="client-filters">
+                <label class="search-field">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="10.5" cy="10.5" r="6.5"/>
+                    <path d="m16 16 4 4"/>
+                  </svg>
+                  <span class="sr-only" data-i18n="Search device ID">Search device ID</span>
+                  <input id="device-search" type="search" placeholder="Search device ID" data-i18n-placeholder="Search device ID" autocomplete="off">
+                </label>
+                <label class="filter-field">
+                  <span data-i18n="Type">Type</span>
+                  <select id="device-kind" aria-label="Client category" data-i18n-aria-label="Client category">
+                    <option value="pc" data-i18n="PC">PC</option>
+                    <option value="mobile" data-i18n="Mobile">Mobile</option>
+                    <option value="web" data-i18n="Web">Web</option>
+                    <option value="cli" data-i18n="CLI">CLI</option>
+                  </select>
+                </label>
+                <button id="device-filter-toggle" class="mobile-filter-toggle" type="button" aria-expanded="false" aria-controls="device-extra-filters" data-i18n="Filters">Filters</button>
+                <div class="client-extra-filters" id="device-extra-filters">
+                  <label class="filter-field">
+                    <span data-i18n="Platform">Platform</span>
+                    <select id="device-platform" aria-label="Client platform" data-i18n-aria-label="Client platform">
+                      <option value="" data-i18n="All platforms">All platforms</option>
+                    </select>
+                  </label>
+                  <label class="filter-field">
+                    <span data-i18n="Version">Version</span>
+                    <select id="device-version" aria-label="Client version" data-i18n-aria-label="Client version">
+                      <option value="" data-i18n="All versions">All versions</option>
+                    </select>
+                  </label>
+                  <div class="sort-controls">
+                    <label class="filter-field">
+                      <span data-i18n="Sort by">Sort by</span>
+                      <select id="device-sort" aria-label="Device sort" data-i18n-aria-label="Device sort">
+                        <option value="status" data-i18n="Status">Status</option>
+                        <option value="updated_at" data-i18n="Last seen">Last seen</option>
+                        <option value="online_since" data-i18n="Online since">Online since</option>
+                        <option value="current_online" data-i18n="Current online">Current online</option>
+                        <option value="device_id" data-i18n="Device ID">Device ID</option>
+                      </select>
+                    </label>
+                    <button id="device-order" class="sort-order" type="button" aria-label="Toggle sort order" data-i18n-aria-label="Toggle sort order" data-i18n="DESC">DESC</button>
+                  </div>
+                </div>
+              </div>
+              <div class="table-wrap list-scroll" tabindex="0" role="region" aria-labelledby="clients-title">
+                <table class="presence-table" aria-labelledby="clients-title">
+                  <thead>
+                    <tr>
+                      <th scope="col" data-i18n="Client">Client</th>
+                      <th scope="col" data-i18n="State">State</th>
+                      <th scope="col" data-i18n="Current online">Current online</th>
+                      <th scope="col" data-i18n="Last seen">Last seen</th>
+                      <th scope="col" data-i18n="Detail">Detail</th>
+                    </tr>
+                  </thead>
+                  <tbody id="devices"></tbody>
+                </table>
+              </div>
+              <div class="pager">
+                <span id="device-page-info" class="page-info">0-0 of 0</span>
+                <div class="pager-actions">
+                  <select id="device-limit" aria-label="Devices per page" data-i18n-aria-label="Devices per page">
+                    <option value="10" data-i18n="10 / page">10 / page</option>
+                    <option value="50" data-i18n="50 / page">50 / page</option>
+                    <option value="100" data-i18n="100 / page">100 / page</option>
+                    <option value="200" data-i18n="200 / page">200 / page</option>
+                  </select>
+                  <button id="device-prev" type="button" data-i18n="Previous">Previous</button>
+                  <button id="device-next" type="button" data-i18n="Next">Next</button>
+                </div>
+              </div>
+            </section>
+            <section id="session-panel" class="panel sessions-panel" aria-labelledby="sessions-title">
+              <div class="section-heading">
+                <h2 id="sessions-title" data-i18n="Active sessions">Active sessions</h2>
+              </div>
+              <div class="session-search-toolbar">
+                <label class="search-field">
+                  <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <circle cx="10.5" cy="10.5" r="6.5"/>
+                    <path d="m16 16 4 4"/>
+                  </svg>
+                  <span class="sr-only" data-i18n="Search session or user">Search session or user</span>
+                  <input id="session-search" type="search" placeholder="Search session or user" data-i18n-placeholder="Search session or user" autocomplete="off">
+                </label>
+              </div>
+              <div class="table-wrap list-scroll" tabindex="0" role="region" aria-labelledby="sessions-title">
+                <table class="sessions-table" aria-labelledby="sessions-title">
+                  <thead>
+                    <tr>
+                      <th scope="col" data-i18n="Host">Host</th>
+                      <th scope="col" data-i18n="Controllers">Controllers</th>
+                      <th scope="col" data-i18n="Action">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody id="sessions"></tbody>
+                </table>
+              </div>
+              <div class="pager">
+                <span id="session-page-info" class="page-info">0-0 of 0</span>
+                <div class="pager-actions">
+                  <select id="session-limit" aria-label="Sessions per page" data-i18n-aria-label="Sessions per page">
+                    <option value="10" data-i18n="10 / page">10 / page</option>
+                    <option value="50" data-i18n="50 / page">50 / page</option>
+                    <option value="100" data-i18n="100 / page">100 / page</option>
+                    <option value="200" data-i18n="200 / page">200 / page</option>
+                  </select>
+                  <button id="session-prev" type="button" data-i18n="Previous">Previous</button>
+                  <button id="session-next" type="button" data-i18n="Next">Next</button>
+                </div>
+              </div>
+            </section>
+          </div>
+        </section>
+        <section id="risk-page" class="hidden" data-page="risk" aria-labelledby="risk-title">
+          <div class="page-heading">
+            <div><h1 id="risk-title" data-i18n="Risk controls">Risk controls</h1>
+              <p class="section-description" data-i18n="Restrict password attempts by source. Signature logins and existing sessions stay available.">Restrict password attempts by source. Signature logins and existing sessions stay available.</p></div>
+            <button id="risk-refresh" type="button" data-i18n="Refresh">Refresh</button>
+          </div>
+          <div class="risk-summary" aria-live="polite">
+            <div class="panel"><span data-i18n="Matching records">Matching records</span><strong id="risk-total">—</strong></div>
+            <div class="panel"><span data-i18n="Restricted now">Restricted now</span><strong id="risk-restricted">—</strong></div>
+            <div class="panel"><span data-i18n="Manual rules">Manual rules</span><strong id="risk-manual">—</strong></div>
+          </div>
+          <section class="panel risk-add" aria-labelledby="risk-add-title">
+            <h2 id="risk-add-title" data-i18n="Add restriction">Add restriction</h2>
+            <form id="risk-form" class="risk-fields">
+              <label><span data-i18n="Type">Type</span><select id="risk-scope"><option value="controller" data-i18n="Controller ID">Controller ID</option><option value="ip" data-i18n="Source IP">Source IP</option></select></label>
+              <label><span data-i18n="Target">Target</span><input id="risk-target" maxlength="128" required autocomplete="off" placeholder="Controller ID or IP" data-i18n-placeholder="Controller ID or IP"></label>
+              <label><span data-i18n="Duration">Duration</span><select id="risk-duration"><option value="60" data-i18n="1 minute">1 minute</option><option value="900" data-i18n="15 minutes">15 minutes</option><option value="3600" selected data-i18n="1 hour">1 hour</option><option value="14400" data-i18n="4 hours">4 hours</option><option value="86400" data-i18n="24 hours">24 hours</option><option value="604800" data-i18n="7 days">7 days</option><option value="2592000" data-i18n="30 days">30 days</option></select></label>
+              <label><span data-i18n="Reason (optional)">Reason (optional)</span><input id="risk-reason" maxlength="64" autocomplete="off"></label>
+              <button id="risk-add" type="submit" class="primary" data-i18n="Add restriction">Add restriction</button>
+            </form>
+            <div id="risk-status" role="status"></div><div id="risk-error" class="error" role="alert"></div>
+          </section>
+          <section class="panel" aria-label="Risk records" data-i18n-aria-label="Risk records">
+            <div class="risk-filters">
+              <input id="risk-search" maxlength="128" placeholder="Search controller, destination or IP" data-i18n-placeholder="Search controller, destination or IP" aria-label="Search controller, destination or IP" data-i18n-aria-label="Search controller, destination or IP">
+              <select id="risk-filter-scope" aria-label="Type" data-i18n-aria-label="Type"><option value="all" data-i18n="All types">All types</option><option value="controller" data-i18n="Controller ID">Controller ID</option><option value="ip" data-i18n="Source IP">Source IP</option><option value="pair" data-i18n="Source → destination">Source → destination</option></select>
+              <select id="risk-filter-kind" aria-label="Rule source" data-i18n-aria-label="Rule source"><option value="all" data-i18n="All records">All records</option><option value="manual" data-i18n="Manual rules">Manual rules</option><option value="auto" data-i18n="Automatic records">Automatic records</option></select>
+            </div>
+            <div class="table-wrap"><table class="risk-table"><thead><tr><th data-i18n="Target">Target</th><th data-i18n="Status">Status</th><th data-i18n="Failures / threshold">Failures / threshold</th><th data-i18n="Remaining wait">Remaining wait</th><th data-i18n="Reason">Reason</th><th data-i18n="Action">Action</th></tr></thead><tbody id="risk-rows"></tbody></table></div>
+            <div class="risk-pager"><span id="risk-page-info" class="muted"></span><div><button id="risk-prev" type="button" data-i18n="Previous">Previous</button><button id="risk-next" type="button" data-i18n="Next">Next</button></div></div>
+          </section>
+        </section>
+        <section id="data-page" class="hidden" data-page="data" aria-labelledby="data-title">
+          <div class="page-heading">
+            <div>
+              <h1 id="data-title" data-i18n="Data management">Data management</h1>
+              <p class="section-description" data-i18n="Query, export and clean device records">Query, export and clean device records</p>
+            </div>
+          </div>
+          <section class="panel data-tools" id="data-tools" aria-labelledby="data-tools-title">
+            <div class="section-heading">
+              <h2 id="data-tools-title" data-i18n="Device data requests">Device data requests</h2>
+            </div>
+            <div class="data-content">
+              <p class="muted" data-i18n="Query one device and its controller identity. Export a database summary or clean offline records after verifying the requester's authority.">Query one device and its controller identity. Export a database summary or clean offline records after verifying the requester's authority.</p>
+              <form id="data-query-form" class="data-fields">
+                <label>
+                  <span data-i18n="Device ID">Device ID</span>
+                  <input id="data-device-id" maxlength="128" pattern="[A-Za-z0-9_\-]+" autocomplete="off" required>
+                </label>
+                <label>
+                  <span data-i18n="Request reference">Request reference</span>
+                  <input id="data-request-ref" maxlength="64" pattern="[A-Za-z0-9_\-]+" autocomplete="off" required>
+                </label>
+                <button id="data-query" type="submit" class="primary" data-i18n="Query data">Query data</button>
+              </form>
+              <p class="muted" data-i18n="Use an opaque case reference, not a name, email, password or verification evidence. For C- identities, enter the original device ID.">Use an opaque case reference, not a name, email, password or verification evidence. For C- identities, enter the original device ID.</p>
+              <div id="data-error" class="error" role="alert"></div>
+              <div id="data-status" role="status"></div>
+              <div id="data-result" class="hidden">
+                <div id="data-summary" class="detail-grid"></div>
+                <div class="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th data-i18n="Device ID">Device ID</th>
+                        <th data-i18n="State">State</th>
+                        <th data-i18n="Last seen">Last seen</th>
+                        <th data-i18n="Client">Client</th>
+                      </tr>
+                    </thead>
+                    <tbody id="data-presence"></tbody>
+                  </table>
+                </div>
+                <p class="muted" data-i18n="Exports exclude passwords, hashes, other devices' identifiers, legacy location fields, runtime subscriptions, logs and backups. Cleanups remove related database rows and current in-memory subscriptions; logs, backups and client-local data need separate handling.">Exports exclude passwords, hashes, other devices' identifiers, legacy location fields, runtime subscriptions, logs and backups. Cleanups remove related database rows and current in-memory subscriptions; logs, backups and client-local data need separate handling.</p>
+                <div class="data-fields">
+                  <label>
+                    <span data-i18n="Admin password">Admin password</span>
+                    <input id="data-admin-password" type="password" autocomplete="off">
+                  </label>
+                  <label class="data-verification">
+                    <input id="data-verified" type="checkbox">
+                    <span data-i18n="I have verified the requester's authority and the requested scope.">I have verified the requester's authority and the requested scope.</span>
+                  </label>
+                  <button id="data-export" type="button" data-i18n="Export summary (JSON)">Export summary (JSON)</button>
+                </div>
+                <div class="data-cleanup">
+                  <label>
+                    <span data-i18n="Cleanup scope">Cleanup scope</span>
+                    <select id="data-scope">
+                      <option value="history" data-i18n="History only — keep device identity">History only — keep device identity</option>
+                      <option value="identity" data-i18n="History and device identity">History and device identity</option>
+                    </select>
+                  </label>
+                  <p id="data-cleanup-help" class="muted"></p>
+                  <label>
+                    <span data-i18n="Type the device ID again to confirm">Type the device ID again to confirm</span>
+                    <input id="data-confirm-id" autocomplete="off" maxlength="128">
+                  </label>
+                  <button id="data-cleanup" type="button" class="danger" data-i18n="Clean selected data">Clean selected data</button>
+                </div>
+              </div>
+            </div>
+          </section>
+        </section>
+        <section id="about-page" class="hidden" data-page="about" aria-labelledby="about-title">
+          <div class="page-heading">
+            <h1 id="about-title" data-i18n="About">About</h1>
+          </div>
+          <div class="about-grid">
+            <section class="panel about-card" aria-labelledby="about-product-title">
+              <span class="eyebrow" data-i18n="SERVER CONSOLE">SERVER CONSOLE</span>
+              <h2 id="about-product-title">CrossDesk Server</h2>
+              <p class="about-description" data-i18n="Device registration, client presence and remote session services for CrossDesk.">Device registration, client presence and remote session services for CrossDesk.</p>
+              <dl class="about-details">
+                <div>
+                  <dt data-i18n="Server version">Server version</dt>
+                  <dd id="about-server-version">—</dd>
+                </div>
+                <div>
+                  <dt data-i18n="License">License</dt>
+                  <dd><a href="https://github.com/kunkundi/crossdesk-server/blob/HEAD/LICENSE" target="_blank" rel="noopener noreferrer">LGPL-3.0 <span aria-hidden="true">↗</span></a></dd>
+                </div>
+              </dl>
+            </section>
+            <section class="panel about-card" aria-labelledby="about-links-title">
+              <h2 id="about-links-title" data-i18n="Project resources">Project resources</h2>
+              <ul class="about-links">
+                <li><a href="https://github.com/kunkundi/crossdesk-server" target="_blank" rel="noopener noreferrer"><span data-i18n="Source code">Source code</span><span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/kunkundi/crossdesk-server#readme" target="_blank" rel="noopener noreferrer"><span data-i18n="Documentation">Documentation</span><span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/kunkundi/crossdesk-server/issues" target="_blank" rel="noopener noreferrer"><span data-i18n="Report an issue">Report an issue</span><span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/kunkundi/crossdesk" target="_blank" rel="noopener noreferrer"><span data-i18n="Desktop client">Desktop client</span><span aria-hidden="true">↗</span></a></li>
+                <li><a href="https://github.com/kunkundi/crossdesk-web-client" target="_blank" rel="noopener noreferrer"><span data-i18n="Web client">Web client</span><span aria-hidden="true">↗</span></a></li>
+              </ul>
+            </section>
+          </div>
+        </section>
+        <footer class="page-footer">
+          <span>
+            CrossDesk
+            <span data-i18n="Administration">Administration</span>
+          </span>
+          <span id="duration-note" class="hidden" data-i18n="Durations update every second while this page is visible.">Durations update every second while this page is visible.</span>
+        </footer>
+      </section>
+    </main>
+    <script defer src="/admin/assets/admin.js?v={{SERVER_VERSION}}"></script>
+  </body>
+</html>

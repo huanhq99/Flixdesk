@@ -1,0 +1,14 @@
+# Xmake cache
+.xmake/
+build/
+cert/
+.env
+/logs/
+
+# MacOS Cache
+.DS_Store
+
+# VSCode cache
+.vscode
+.vs
+continuous-desk-server.code-workspace

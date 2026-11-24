@@ -1,0 +1,988 @@
+#include "admin_controller.h"
+#include "session_recovery.h"
+#include "notification_service.h"
+#include "log.h"
+
+#include <algorithm>
+#include <asio/ip/address.hpp>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <system_error>
+#include <unordered_map>
+#include <vector>
+
+#ifndef CROSSDESK_SERVER_VERSION
+#define CROSSDESK_SERVER_VERSION "dev"
+#endif
+
+namespace {
+
+constexpr char kSessionCookieName[] = "cd_admin_session";
+constexpr char kDisconnectPrefix[] = "/api/admin/sessions/";
+constexpr char kDisconnectSuffix[] = "/disconnect";
+constexpr size_t kDefaultPageLimit = 50;
+constexpr size_t kMaxPageLimit = 200;
+constexpr char kAdminAssetPrefix[] = "/admin/assets/";
+constexpr char kServerVersionPlaceholder[] = "{{SERVER_VERSION}}";
+
+std::string ResourcePath(const std::string& resource) {
+  size_t query_pos = resource.find('?');
+  return query_pos == std::string::npos ? resource
+                                        : resource.substr(0, query_pos);
+}
+
+std::string ResourceQuery(const std::string& resource) {
+  size_t query_pos = resource.find('?');
+  return query_pos == std::string::npos ? "" : resource.substr(query_pos + 1);
+}
+
+bool IsAdminPagePath(std::string path) {
+  if (!path.empty() && path.back() == '/') path.pop_back();
+  return path == "/admin" || path == "/admin/overview" ||
+         path == "/admin/data" || path == "/admin/about" ||
+         path == "/admin/announcements" || path == "/admin/risk";
+}
+
+int HexValue(char ch) {
+  if (ch >= '0' && ch <= '9') return ch - '0';
+  if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+  if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+  return -1;
+}
+
+std::string UrlDecode(const std::string& value) {
+  std::string decoded;
+  decoded.reserve(value.size());
+  for (size_t i = 0; i < value.size(); ++i) {
+    char ch = value[i];
+    if (ch == '+') {
+      decoded.push_back(' ');
+    } else if (ch == '%' && i + 2 < value.size()) {
+      int hi = HexValue(value[i + 1]);
+      int lo = HexValue(value[i + 2]);
+      if (hi >= 0 && lo >= 0) {
+        decoded.push_back(static_cast<char>((hi << 4) | lo));
+        i += 2;
+      } else {
+        decoded.push_back(ch);
+      }
+    } else {
+      decoded.push_back(ch);
+    }
+  }
+  return decoded;
+}
+
+std::map<std::string, std::string> ParseQueryParams(
+    const std::string& query_string) {
+  std::map<std::string, std::string> params;
+  size_t start = 0;
+  while (start <= query_string.size()) {
+    size_t end = query_string.find('&', start);
+    std::string item =
+        query_string.substr(start, end == std::string::npos
+                                       ? std::string::npos
+                                       : end - start);
+    if (!item.empty()) {
+      size_t equals = item.find('=');
+      std::string key = UrlDecode(item.substr(0, equals));
+      std::string value = equals == std::string::npos
+                              ? ""
+                              : UrlDecode(item.substr(equals + 1));
+      params[key] = value;
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    start = end + 1;
+  }
+  return params;
+}
+
+bool ParseSize(const std::string& value, size_t* result) {
+  if (value.empty()) {
+    return false;
+  }
+  size_t parsed = 0;
+  for (unsigned char ch : value) {
+    if (!std::isdigit(ch)) {
+      return false;
+    }
+    size_t digit = static_cast<size_t>(ch - '0');
+    if (parsed > (static_cast<size_t>(-1) - digit) / 10) {
+      return false;
+    }
+    parsed = parsed * 10 + digit;
+  }
+  *result = parsed;
+  return true;
+}
+
+size_t QuerySizeParam(const std::map<std::string, std::string>& params,
+                      const std::string& key, size_t fallback,
+                      size_t max_value) {
+  auto it = params.find(key);
+  if (it == params.end()) {
+    return fallback;
+  }
+  size_t value = 0;
+  if (!ParseSize(it->second, &value)) {
+    return fallback;
+  }
+  return (std::min)(value, max_value);
+}
+
+std::string QueryStringParam(const std::map<std::string, std::string>& params,
+                             const std::string& key) {
+  auto it = params.find(key);
+  return it == params.end() ? "" : it->second;
+}
+
+std::string QueryStringParam(const std::map<std::string, std::string>& params,
+                             const std::string& key,
+                             const std::string& fallback) {
+  auto it = params.find(key);
+  return it == params.end() || it->second.empty() ? fallback : it->second;
+}
+
+std::string LowerAscii(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  return value;
+}
+
+std::string ClientKind(const OnlineDeviceInfo& device) {
+  if (device.device_id.rfind("web-", 0) == 0) return "web";
+  if (device.device_id.rfind("cli-", 0) == 0) return "cli";
+  const std::string platform = LowerAscii(device.client_platform);
+  return platform == "ios" || platform == "android" ? "mobile" : "device";
+}
+
+std::string NormalizeDeviceKind(const std::string& kind) {
+  std::string normalized = LowerAscii(kind);
+  if (normalized == "web" || normalized == "cli" || normalized == "mobile" ||
+      normalized == "all") {
+    return normalized;
+  }
+  return "pc";
+}
+
+int64_t CountForDeviceFilter(const DevicePresenceCounts& counts,
+                             const std::string& filter) {
+  std::string normalized = filter;
+  std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                 [](unsigned char ch) {
+                   return static_cast<char>(std::tolower(ch));
+                 });
+  if (normalized == "online") {
+    return counts.online;
+  }
+  if (normalized == "offline") {
+    return counts.offline;
+  }
+  if (normalized == "active") {
+    return counts.active;
+  }
+  if (normalized == "web") {
+    return counts.web;
+  }
+  if (normalized == "cli") return counts.cli;
+  return counts.all;
+}
+
+std::vector<std::filesystem::path> AdminWebRootCandidates() {
+  std::vector<std::filesystem::path> roots;
+  const char* env_root = std::getenv("CROSSDESK_ADMIN_WEB_DIR");
+  if (env_root && *env_root) {
+    roots.emplace_back(env_root);
+  }
+  roots.emplace_back("/crossdesk-server/admin");
+  roots.emplace_back("/usr/share/crossdesk/admin");
+  roots.emplace_back("src/admin/web");
+  roots.emplace_back("../src/admin/web");
+  std::error_code ec;
+  std::filesystem::path cwd = std::filesystem::current_path(ec);
+  while (!ec && !cwd.empty()) {
+    roots.emplace_back(cwd / "src/admin/web");
+    if (cwd == cwd.parent_path()) {
+      break;
+    }
+    cwd = cwd.parent_path();
+  }
+  return roots;
+}
+
+const std::set<std::string>& AdminAllowedWebFiles() {
+  static const std::set<std::string> kAllowedFiles = {
+      "index.html", "admin.css", "admin.js", "crossdesk-logo.png"};
+  return kAllowedFiles;
+}
+
+std::filesystem::path ResolveAdminWebRoot() {
+  for (const auto& root : AdminWebRootCandidates()) {
+    std::filesystem::path index_path = root / "index.html";
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(index_path, ec)) {
+      return root;
+    }
+  }
+  return {};
+}
+
+const std::filesystem::path& AdminWebRoot() {
+  static const std::filesystem::path kRoot = ResolveAdminWebRoot();
+  return kRoot;
+}
+
+void WarmAdminWebRoot() { (void)AdminWebRoot(); }
+
+bool ReadAdminWebFile(const std::string& file_name, std::string* content) {
+  if (!content ||
+      AdminAllowedWebFiles().find(file_name) == AdminAllowedWebFiles().end()) {
+    return false;
+  }
+
+  static std::mutex cache_mutex;
+  static std::unordered_map<std::string, std::string> cache;
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  auto cached = cache.find(file_name);
+  if (cached != cache.end()) {
+    *content = cached->second;
+    return true;
+  }
+
+  const auto& root = AdminWebRoot();
+  if (root.empty()) {
+    return false;
+  }
+
+  std::filesystem::path path = root / file_name;
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    return false;
+  }
+  std::string body((std::istreambuf_iterator<char>(file)),
+                   std::istreambuf_iterator<char>());
+  *content = body;
+  cache.emplace(file_name, std::move(body));
+  return true;
+}
+
+std::string AdminAssetNameFromPath(const std::string& path) {
+  if (path.rfind(kAdminAssetPrefix, 0) != 0) {
+    return "";
+  }
+  std::string file_name = path.substr(std::string(kAdminAssetPrefix).size());
+  if (file_name.find('/') != std::string::npos ||
+      file_name.find('\\') != std::string::npos) {
+    return "";
+  }
+  return file_name;
+}
+
+std::string AdminAssetContentType(const std::string& file_name) {
+  if (file_name == "admin.css") {
+    return "text/css; charset=utf-8";
+  }
+  if (file_name == "admin.js") {
+    return "application/javascript; charset=utf-8";
+  }
+  if (file_name == "crossdesk-logo.png") {
+    return "image/png";
+  }
+  return "application/octet-stream";
+}
+
+std::string AdminDisabledHtml() {
+  return "<!doctype html><html><head><meta charset=\"utf-8\"><title>CrossDesk "
+         "Admin</title></head><body><h1>CrossDesk Admin</h1><p>Admin "
+         "dashboard is not enabled. Set ADMIN_USERNAME and ADMIN_PASSWORD to "
+         "enable it.</p></body></html>";
+}
+
+std::string JsonContentType() { return "application/json; charset=utf-8"; }
+
+}  // namespace
+
+AdminController::AdminController(
+    AdminAuth* auth, PresenceManager* presence,
+    std::shared_ptr<TransmissionManager> transmission, DeviceDBManager* db,
+    std::function<void(const std::string&, nlohmann::json)> send_to_user,
+    std::chrono::milliseconds stats_ttl)
+    : stats_ttl_(stats_ttl),
+      auth_(auth),
+      presence_(presence),
+      transmission_(std::move(transmission)),
+      db_(db),
+      send_to_user_(std::move(send_to_user)) {
+  WarmAdminWebRoot();
+}
+
+bool AdminController::IsAdminRoute(const std::string& resource) {
+  std::string path = ResourcePath(resource);
+  return IsAdminPagePath(path) || path.rfind(kAdminAssetPrefix, 0) == 0 ||
+         path == "/api/admin" || path.rfind("/api/admin/", 0) == 0;
+}
+
+std::string AdminController::ExtractDisconnectTransmissionId(
+    const std::string& resource) {
+  std::string path = ResourcePath(resource);
+  if (path.rfind(kDisconnectPrefix, 0) != 0) {
+    return "";
+  }
+
+  std::string tail = path.substr(std::string(kDisconnectPrefix).size());
+  if (tail.size() <= std::string(kDisconnectSuffix).size()) {
+    return "";
+  }
+
+  size_t suffix_pos = tail.rfind(kDisconnectSuffix);
+  if (suffix_pos == std::string::npos ||
+      suffix_pos + std::string(kDisconnectSuffix).size() != tail.size()) {
+    return "";
+  }
+
+  return tail.substr(0, suffix_pos);
+}
+
+AdminHttpResponse AdminController::Handle(const AdminHttpRequest& request) {
+  std::string path = ResourcePath(request.resource);
+  if (IsAdminPagePath(path)) {
+    return HandleAdminPage();
+  }
+  if (path.rfind(kAdminAssetPrefix, 0) == 0) {
+    return HandleAdminAsset(request);
+  }
+
+  if (!auth_ || !auth_->IsEnabled()) {
+    return ErrorResponse(503, "admin_disabled");
+  }
+
+  if (path == "/api/admin/login") {
+    return HandleLogin(request);
+  }
+
+  if (!IsAuthorized(request)) {
+    return ErrorResponse(401, "unauthorized");
+  }
+
+  if (path == "/api/admin/risk") return HandleRiskControl(request);
+
+  if (NotificationService::IsAdminRoute(path)) {
+    if (!notifications_) return ErrorResponse(503, "notifications_unavailable");
+    if (request.method == "POST") {
+      const auto token =
+          AdminAuth::ExtractCookie(request.cookie, kSessionCookieName);
+      if (!auth_->ValidateCsrf(token, request.csrf_token))
+        return ErrorResponse(403, "invalid_csrf");
+      if (request.content_type != "application/json" &&
+          request.content_type != "application/json; charset=utf-8")
+        return ErrorResponse(415, "json_required");
+    }
+    const auto result = notifications_->HandleAdminRequest(
+        request.method, request.resource, request.body);
+    return JsonResponse(result.status, result.body);
+  }
+
+  if (path == "/api/admin/data-session" ||
+      path.rfind("/api/admin/device-data/", 0) == 0) {
+    return HandleDeviceData(request);
+  }
+
+  if (path == "/api/admin/logout") {
+    return HandleLogout(request);
+  }
+  if (path == "/api/admin/stats") {
+    return HandleStats(request);
+  }
+  if (path == "/api/admin/overview") {
+    return HandleOverview(request);
+  }
+  if (!ExtractDisconnectTransmissionId(path).empty()) {
+    return HandleDisconnect(request);
+  }
+
+  return ErrorResponse(404, "not_found");
+}
+
+AdminHttpResponse AdminController::HandleRiskControl(const AdminHttpRequest& request) {
+  if (!db_ || !auth_limiter_) return ErrorResponse(503, "risk_unavailable");
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+  if (request.method == "GET") {
+    const auto rules = db_->RiskRules();
+    if (!rules.is_array()) return ErrorResponse(503, "risk_unavailable");
+    std::map<std::pair<std::string, std::string>, json> entries;
+    auto entry = [&](const std::string& scope, const std::string& target) -> json& {
+      auto& item = entries[{scope, target}];
+      if (item.is_null()) item = {{"scope", scope}, {"target", target}, {"failures", 0},
+          {"threshold", scope == "pair" ? DeviceAuthLimiter::kTargetFailures : DeviceAuthLimiter::kSourceFailures},
+          {"retry_after", 0}, {"reset_after", 0}, {"manual", false}, {"reason", ""},
+          {"operations", json::array()}, {"expires_at", 0}};
+      return item;
+    };
+    for (const auto& state : auth_limiter_->Snapshot()) {
+      const auto key = json::parse(state.target, nullptr, false);
+      if (!key.is_array() || key.size() != (state.source ? 2 : 3)) continue;
+      auto& item = entry(state.source ? key[0].get<std::string>() : "pair",
+                         state.source ? key[1].get<std::string>() : state.target);
+      item["source_scope"] = key[0]; item["source"] = key[1];
+      if (!state.source) item["destination"] = key[2];
+      item["failures"] = state.failures; item["threshold"] = state.threshold;
+      item["retry_after"] = state.retry_after; item["reset_after"] = state.reset_after;
+      for (const auto& [operation, name] : {
+          std::pair{DeviceAuthLimiter::Operation::DeviceLogin, "device_login"},
+          std::pair{DeviceAuthLimiter::Operation::RemoteConnection, "remote_connection"},
+          std::pair{DeviceAuthLimiter::Operation::MemberQuery, "member_query"},
+          std::pair{DeviceAuthLimiter::Operation::DeviceKeyBinding, "device_key_binding"}}) {
+        if (state.operations & static_cast<uint8_t>(operation))
+          item["operations"].push_back(name);
+      }
+    }
+    for (const auto& rule : rules) {
+      const int64_t remaining = rule.at("expires_at").get<int64_t>() - now;
+      if (remaining <= 0) continue;
+      auto& item = entry(rule.at("scope"), rule.at("target"));
+      item["manual"] = true; item["reason"] = rule.at("reason");
+      item["expires_at"] = rule.at("expires_at");
+      item["retry_after"] = std::max<int64_t>(item["retry_after"].get<int64_t>(), remaining);
+    }
+    const auto params = ParseQueryParams(ResourceQuery(request.resource));
+    const auto search = QueryStringParam(params, "search");
+    const auto scope = QueryStringParam(params, "scope", "all");
+    const auto kind = QueryStringParam(params, "kind", "all");
+    if (search.size() > 128 || (scope != "all" && scope != "controller" && scope != "ip" && scope != "pair") ||
+        (kind != "all" && kind != "manual" && kind != "auto"))
+      return ErrorResponse(400, "invalid_request");
+    std::vector<json> rows;
+    size_t manual = 0, blocked = 0;
+    for (auto& [key, item] : entries) {
+      if ((scope != "all" && key.first != scope) || key.second.find(search) == std::string::npos ||
+          (kind == "manual" && !item["manual"].get<bool>()) ||
+          (kind == "auto" && item["manual"].get<bool>())) continue;
+      manual += item["manual"].get<bool>(); blocked += item["retry_after"].get<int64_t>() > 0;
+      rows.push_back(std::move(item));
+    }
+    std::sort(rows.begin(), rows.end(), [](const json& a, const json& b) {
+      if (a["retry_after"] != b["retry_after"]) return a["retry_after"] > b["retry_after"];
+      return std::make_pair(a["scope"].get<std::string>(), a["target"].get<std::string>()) <
+             std::make_pair(b["scope"].get<std::string>(), b["target"].get<std::string>());
+    });
+    constexpr size_t limit = 50;
+    const size_t offset = std::min(QuerySizeParam(params, "offset", 0, 40000),
+        rows.empty() ? size_t(0) : ((rows.size() - 1) / limit) * limit);
+    auto items = json::array();
+    for (size_t i = offset; i < std::min(rows.size(), offset + limit); ++i)
+      items.push_back(std::move(rows[i]));
+    return JsonResponse(200, {{"items", items}, {"total", rows.size()}, {"offset", offset},
+        {"limit", limit}, {"restricted", blocked}, {"manual", manual}});
+  }
+  if (request.method != "POST") return ErrorResponse(405, "method_not_allowed");
+  const auto token = AdminAuth::ExtractCookie(request.cookie, kSessionCookieName);
+  if (!auth_->ValidateCsrf(token, request.csrf_token)) return ErrorResponse(403, "invalid_csrf");
+  if (request.content_type != "application/json" && request.content_type != "application/json; charset=utf-8")
+    return ErrorResponse(415, "json_required");
+  if (request.body.size() > 2048) return ErrorResponse(413, "request_too_large");
+  const auto body = json::parse(request.body, nullptr, false);
+  if (!body.is_object()) return ErrorResponse(400, "invalid_json");
+  for (const auto* field : {"action", "scope", "target"})
+    if (!body.contains(field) || !body[field].is_string()) return ErrorResponse(400, "invalid_request");
+  const auto action = body["action"].get<std::string>(), scope = body["scope"].get<std::string>();
+  auto target = body["target"].get<std::string>();
+  if ((action != "restrict" && action != "clear") ||
+      (scope != "controller" && scope != "ip" && !(scope == "pair" && action == "clear")) ||
+      target.empty() || target.size() > (scope == "pair" ? 2048 : 128) ||
+      target.find('\0') != std::string::npos)
+    return ErrorResponse(400, "invalid_risk_target");
+  if (scope == "ip" && !(action == "clear" && target == "unknown")) {
+    asio::error_code error;
+    auto address = asio::ip::make_address(target, error);
+    if (error) return ErrorResponse(400, "invalid_risk_target");
+    if (address.is_v6() && address.to_v6().is_v4_mapped())
+      address = asio::ip::make_address_v4(asio::ip::v4_mapped, address.to_v6());
+    target = address.to_string();
+  } else if (action == "restrict" && scope == "controller" && (target.rfind("C-", 0) == 0 ||
+      !std::all_of(target.begin(), target.end(), [](unsigned char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+               (c >= 'A' && c <= 'Z') || c == '-' || c == '_';
+      }))) return ErrorResponse(400, "invalid_risk_target");
+  if (action == "clear") {
+    if (scope == "pair") {
+      const auto pair = json::parse(target, nullptr, false);
+      if (!pair.is_array() || pair.size() != 3 ||
+          !std::all_of(pair.begin(), pair.end(), [](const json& v) { return v.is_string(); }) ||
+          (pair[0] != "controller" && pair[0] != "ip"))
+        return ErrorResponse(400, "invalid_risk_target");
+      target = pair.dump();
+      auth_limiter_->Clear(false, target);
+    } else {
+      if (!db_->DeleteRiskRule(scope, target)) return ErrorResponse(503, "risk_unavailable");
+      const auto source = json::array({scope, target});
+      // Clearing a source also clears its per-destination records. Preserve
+      // in-flight reservations through the limiter's generation checks.
+      const auto source_key = source.dump();
+      auth_limiter_->ClearMatching([&](bool is_source, const std::string& key) {
+        if (is_source) return key == source_key;
+        const auto pair = json::parse(key, nullptr, false);
+        return pair.is_array() && pair.size() == 3 && pair[0] == source[0] && pair[1] == source[1];
+      });
+    }
+  } else {
+    if (!body.contains("duration_seconds") || !body["duration_seconds"].is_number_integer() ||
+        body["duration_seconds"] < 60 || body["duration_seconds"] > 30 * 86400 ||
+        !body.contains("reason") || !body["reason"].is_string())
+      return ErrorResponse(400, "invalid_risk_rule");
+    const auto reason = body["reason"].get<std::string>();
+    if (reason.size() > 256 || reason.find('\0') != std::string::npos)
+      return ErrorResponse(400, "invalid_risk_rule");
+    if (!db_->SetRiskRule(scope, target, now + body["duration_seconds"].get<int>(), reason))
+      return ErrorResponse(409, "risk_rule_not_saved");
+  }
+  LOG_INFO("Admin [{}] risk control [{}] scope [{}] target [{}]", auth_->Username(), action, scope, target);
+  return JsonResponse(200, {{"ok", true}, {"target", target}});
+}
+
+AdminHttpResponse AdminController::HandleAdminPage() {
+  if (!auth_ || !auth_->IsEnabled()) {
+    return HtmlResponse(200, AdminDisabledHtml());
+  }
+  std::string body;
+  if (!ReadAdminWebFile("index.html", &body)) {
+    return HtmlResponse(
+        500,
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>CrossDesk "
+        "Admin</title></head><body><h1>CrossDesk Admin</h1><p>Admin frontend "
+        "assets were not found.</p></body></html>");
+  }
+  const std::string version = CROSSDESK_SERVER_VERSION;
+  size_t version_pos = 0;
+  while ((version_pos = body.find(kServerVersionPlaceholder, version_pos)) !=
+         std::string::npos) {
+    body.replace(version_pos, sizeof(kServerVersionPlaceholder) - 1,
+                 version);
+    version_pos += version.size();
+  }
+  return HtmlResponse(200, body);
+}
+
+AdminHttpResponse AdminController::HandleLogin(
+    const AdminHttpRequest& request) {
+  if (request.method != "POST") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  nlohmann::json body;
+  try {
+    body = nlohmann::json::parse(request.body);
+  } catch (...) {
+    return ErrorResponse(400, "invalid_json");
+  }
+
+  if (!body.contains("username") || !body["username"].is_string() ||
+      !body.contains("password") || !body["password"].is_string()) {
+    return ErrorResponse(400, "invalid_json");
+  }
+
+  const auto result = auth_->Login(body["username"].get<std::string>(),
+                                    body["password"].get<std::string>(),
+                                    request.source_address);
+  if (result.retry_after > 0) {
+    auto response = JsonResponse(429, {{"ok", false},
+                                       {"error", "too_many_login_attempts"},
+                                       {"retry_after", result.retry_after}});
+    response.headers.push_back({"Retry-After", std::to_string(result.retry_after)});
+    return response;
+  }
+  if (!result.token.has_value()) {
+    return ErrorResponse(401, "unauthorized");
+  }
+
+  AdminHttpResponse response = JsonResponse(200, {{"ok", true}});
+  response.headers.push_back({"Set-Cookie", auth_->BuildSessionCookie(*result.token)});
+  return response;
+}
+
+AdminHttpResponse AdminController::HandleLogout(
+    const AdminHttpRequest& request) {
+  if (request.method != "POST") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  std::string token = AdminAuth::ExtractCookie(request.cookie, kSessionCookieName);
+  if (!token.empty()) {
+    auth_->Logout(token);
+  }
+
+  AdminHttpResponse response = JsonResponse(200, {{"ok", true}});
+  response.headers.push_back({"Set-Cookie", auth_->BuildExpiredCookie()});
+  return response;
+}
+
+AdminHttpResponse AdminController::HandleStats(
+    const AdminHttpRequest& request) {
+  if (request.method != "GET") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  return JsonResponse(200, {{"stats", BuildAdminStats()}});
+}
+
+AdminHttpResponse AdminController::HandleOverview(
+    const AdminHttpRequest& request) {
+  if (request.method != "GET") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  auto params = ParseQueryParams(ResourceQuery(request.resource));
+  size_t device_limit =
+      QuerySizeParam(params, "device_limit", kDefaultPageLimit, kMaxPageLimit);
+  size_t device_offset =
+      QuerySizeParam(params, "device_offset", 0, static_cast<size_t>(-1));
+  std::string device_search = QueryStringParam(params, "device_search");
+  std::string device_filter =
+      QueryStringParam(params, "device_filter", "online");
+  std::string device_kind = NormalizeDeviceKind(
+      QueryStringParam(params, "device_kind", "pc"));
+  std::string device_platform = QueryStringParam(params, "device_platform");
+  std::string device_version = QueryStringParam(params, "device_version");
+  std::string device_sort =
+      QueryStringParam(params, "device_sort", "status");
+  std::string device_order =
+      QueryStringParam(params, "device_order", "desc");
+  size_t session_limit =
+      QuerySizeParam(params, "session_limit", kDefaultPageLimit, kMaxPageLimit);
+  size_t session_offset =
+      QuerySizeParam(params, "session_offset", 0, static_cast<size_t>(-1));
+  std::string session_search = QueryStringParam(params, "session_search");
+
+  nlohmann::json devices = nlohmann::json::array();
+  size_t devices_total = 0;
+  nlohmann::json device_counts = {{"all", 0},
+                                  {"online", 0},
+                                  {"offline", 0},
+                                  {"active", 0},
+                                  {"web", 0},
+                                  {"cli", 0}};
+  nlohmann::json device_kind_counts = {
+      {"pc", 0}, {"mobile", 0}, {"web", 0}, {"cli", 0}};
+  DeviceClientFilterOptions client_filter_options;
+  if (db_) {
+    DevicePresenceCounts counts =
+        db_->CountDevicePresenceByFilters(device_search, device_kind,
+                                          device_platform, device_version);
+    DevicePresenceCounts pc_counts =
+        device_kind == "pc"
+            ? counts
+            : db_->CountDevicePresenceByFilters(device_search, "pc",
+                                                device_platform, device_version);
+    DevicePresenceCounts web_counts =
+        device_kind == "web"
+            ? counts
+            : db_->CountDevicePresenceByFilters(device_search, "web",
+                                                device_platform, device_version);
+    DevicePresenceCounts mobile_counts =
+        device_kind == "mobile"
+            ? counts
+            : db_->CountDevicePresenceByFilters(device_search, "mobile",
+                                                device_platform, device_version);
+    DevicePresenceCounts cli_counts =
+        device_kind == "cli"
+            ? counts
+            : db_->CountDevicePresenceByFilters(device_search, "cli",
+                                                device_platform, device_version);
+    client_filter_options = db_->ListDeviceClientFilterOptions(device_kind);
+    device_counts["all"] = counts.all;
+    device_counts["online"] = counts.online;
+    device_counts["offline"] = counts.offline;
+    device_counts["active"] = counts.active;
+    device_counts["web"] = web_counts.all;
+    device_counts["cli"] = cli_counts.all;
+    device_kind_counts["pc"] = pc_counts.all;
+    device_kind_counts["mobile"] = mobile_counts.all;
+    device_kind_counts["web"] = web_counts.all;
+    device_kind_counts["cli"] = cli_counts.all;
+    devices_total =
+        static_cast<size_t>(CountForDeviceFilter(counts, device_filter));
+    std::vector<OnlineDeviceInfo> device_rows = db_->ListDevicePresence(
+        device_limit, device_offset, device_search, device_filter, device_sort,
+        device_order, device_kind, device_platform, device_version);
+    for (const auto& device : device_rows) {
+      int64_t active_control_count = device.active_control_count;
+      int64_t active_controlled_count = device.active_controlled_count;
+      devices.push_back({{"id", device.device_id},
+                         {"online", device.online},
+                         {"kind", ClientKind(device)},
+                         {"client_version", device.client_version},
+                         {"client_platform", device.client_platform},
+                         {"updated_at", device.updated_at},
+                         {"last_online_at",
+                          device.online ? 0 : device.updated_at},
+                         {"online_since", device.online_since},
+                         {"online_duration_seconds",
+                          device.online_duration_seconds},
+                         {"current_control_seconds",
+                          device.current_control_seconds},
+                         {"current_controlled_seconds",
+                          device.current_controlled_seconds},
+                         {"active_control_count", active_control_count},
+                         {"active_controlled_count",
+                          active_controlled_count},
+                         {"active_control_targets",
+                          device.active_control_targets},
+                         {"active_controlled_by",
+                          device.active_controlled_by},
+                         {"active_session_count",
+                          active_control_count +
+                              active_controlled_count}});
+    }
+  }
+
+  nlohmann::json sessions = nlohmann::json::array();
+  size_t sessions_total = 0;
+  if (db_) {
+    sessions_total =
+        static_cast<size_t>(db_->CountRemoteControlTransmissions(
+            session_search));
+    for (const auto& session : db_->ListRemoteControlSessions(
+             session_limit, session_offset, session_search)) {
+      size_t recovering = 0;
+      if (recovery_) for (const auto& guest : session.guest_ids)
+        if (recovery_->IsRecovering(session.transmission_id, guest)) ++recovering;
+      sessions.push_back({{"transmission_id", session.transmission_id},
+                          {"host_id", session.host_id},
+                          {"guest_ids", session.guest_ids},
+                          {"participant_count", 1 + session.guest_ids.size()},
+                          {"recovering_count", recovering},
+                          {"active", recovering < session.guest_ids.size()}});
+    }
+  }
+  if (sessions_total == 0 && transmission_) {
+    for (const auto& snapshot : transmission_->GetTransmissionSnapshots(
+             session_limit, session_offset, session_search, &sessions_total,
+             true)) {
+      sessions.push_back({{"transmission_id", snapshot.transmission_id},
+                          {"host_id", snapshot.host_id},
+                          {"guest_ids", snapshot.guest_ids},
+                          {"participant_count", snapshot.participant_count},
+                          {"active", snapshot.active}});
+    }
+  }
+
+  nlohmann::json stats = BuildAdminStats();
+
+  nlohmann::json devices_page = {{"limit", device_limit},
+                                 {"offset", device_offset},
+                                 {"total", devices_total},
+                                 {"search", device_search},
+                                 {"filter", device_filter},
+                                 {"kind", device_kind},
+                                 {"platform", device_platform},
+                                 {"version", device_version},
+                                 {"sort", device_sort},
+                                 {"order", device_order}};
+  nlohmann::json sessions_page = {{"limit", session_limit},
+                                  {"offset", session_offset},
+                                  {"total", sessions_total},
+                                  {"search", session_search}};
+
+  return JsonResponse(200, {{"stats", stats},
+                            {"devices", devices},
+                            {"devices_page", devices_page},
+                            {"device_counts", device_counts},
+                            {"device_kind_counts", device_kind_counts},
+                            {"device_client_filters",
+                             {{"platforms", client_filter_options.platforms},
+                              {"versions", client_filter_options.versions}}},
+                            {"sessions", sessions},
+                            {"sessions_page", sessions_page}});
+}
+
+AdminHttpResponse AdminController::HandleAdminAsset(
+    const AdminHttpRequest& request) {
+  if (request.method != "GET") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  std::string file_name = AdminAssetNameFromPath(ResourcePath(request.resource));
+  std::string body;
+  if (file_name.empty() || !ReadAdminWebFile(file_name, &body)) {
+    return ErrorResponse(404, "not_found");
+  }
+
+  AdminHttpResponse response;
+  response.status = 200;
+  response.content_type = AdminAssetContentType(file_name);
+  response.headers.push_back({"Cache-Control", "public, max-age=3600"});
+  response.body = std::move(body);
+  return response;
+}
+
+AdminHttpResponse AdminController::HandleDisconnect(
+    const AdminHttpRequest& request) {
+  if (request.method != "POST") {
+    return ErrorResponse(405, "method_not_allowed");
+  }
+
+  std::string transmission_id =
+      ExtractDisconnectTransmissionId(request.resource);
+  if (transmission_id.empty()) {
+    return ErrorResponse(404, "not_found");
+  }
+
+  if (recovery_ && db_) {
+    for (const auto& session : db_->ListRemoteControlSessions(10000, 0, transmission_id))
+      if (session.transmission_id == transmission_id)
+        for (const auto& guest : session.guest_ids)
+          if (recovery_->IsRecovering(transmission_id, guest))
+            return ErrorResponse(409, "session_recovering");
+  }
+
+  bool existed = false;
+  if (transmission_) {
+    auto snapshots = transmission_->GetTransmissionSnapshots();
+    for (const auto& snapshot : snapshots) {
+      if (snapshot.transmission_id != transmission_id) {
+        continue;
+      }
+      existed = true;
+      nlohmann::json message = {{"type", "admin_disconnect_transmission"},
+                                {"transmission_id", transmission_id}};
+      if (send_to_user_) {
+        send_to_user_(snapshot.host_id, message);
+        for (const auto& guest_id : snapshot.guest_ids) {
+          send_to_user_(guest_id, message);
+        }
+      }
+      break;
+    }
+    transmission_->DisconnectTransmission(transmission_id);
+  }
+
+  bool persisted = false;
+  if (db_) {
+    for (const auto& session : db_->ListRemoteControlSessions(
+             static_cast<size_t>((std::numeric_limits<int>::max)()), 0,
+             transmission_id)) {
+      if (session.transmission_id == transmission_id) {
+        persisted = true;
+        break;
+      }
+    }
+    if (persisted) {
+      db_->EndRemoteControlTransmission(transmission_id);
+    }
+  }
+
+  if (!existed && !persisted) {
+    return JsonResponse(200, {{"ok", true}, {"already_closed", true}});
+  }
+  return JsonResponse(200, {{"ok", true}});
+}
+
+bool AdminController::IsAuthorized(const AdminHttpRequest& request) {
+  if (!auth_) {
+    return false;
+  }
+  std::string token = AdminAuth::ExtractCookie(request.cookie, kSessionCookieName);
+  return auth_->ValidateSession(token);
+}
+
+nlohmann::json AdminController::BuildAdminStats() const {
+  auto stats = BuildStats();
+  stats["daily_active_controllers"] = db_ ? db_->GetDailyControllerStats()
+                                        : nlohmann::json(nullptr);
+  return stats;
+}
+
+nlohmann::json AdminController::BuildStats() const {
+  const auto now = std::chrono::steady_clock::now();
+  if (!stats_cache_.is_null() && now - stats_cached_at_ < stats_ttl_)
+    return stats_cache_;
+  OnlineDurationStats duration_stats;
+  if (db_) {
+    duration_stats = db_->GetOnlineDurationStats();
+  }
+  // Keep the existing native-device total for clients of /api/stats. The
+  // dashboard separates PCs and mobile clients using the reported platform,
+  // which can arrive after login and is persisted across disconnects.
+  const size_t online_device_count = presence_
+      ? presence_->GetOnlineDeviceCount()
+      : db_ ? static_cast<size_t>(db_->CountOnlineDevices()) : 0;
+  const size_t online_mobile_client_count = db_
+      ? static_cast<size_t>(db_->CountDevicePresence("", "online", "mobile"))
+      : 0;
+  const size_t online_web_client_count = presence_
+      ? presence_->GetOnlineWebClientCount()
+      : db_ ? static_cast<size_t>(db_->CountDevicePresence("", "online", "web")) : 0;
+  const size_t online_cli_client_count = presence_
+      ? presence_->GetOnlineCliClientCount()
+      : db_ ? static_cast<size_t>(db_->CountDevicePresence("", "online", "cli")) : 0;
+  size_t active_connection_count =
+      transmission_ ? transmission_->GetActiveConnectionCount() : 0;
+  if (db_) {
+    active_connection_count = (std::max)(
+        active_connection_count,
+        static_cast<size_t>(db_->CountActiveRemoteControlConnections()));
+  }
+
+  stats_cached_at_ = now;
+  stats_cache_ = {{"server_version", CROSSDESK_SERVER_VERSION},
+          {"session_resume_version", 1},
+          {"online_device_count", online_device_count},
+          {"online_pc_client_count", online_device_count >= online_mobile_client_count
+               ? online_device_count - online_mobile_client_count : 0},
+          {"online_mobile_client_count", online_mobile_client_count},
+          {"online_web_client_count", online_web_client_count},
+          {"online_cli_client_count", online_cli_client_count},
+          {"active_connection_count", active_connection_count},
+          {"online_duration_seconds",
+           duration_stats.current_online_seconds}};
+  if (recovery_) {
+    const auto status = recovery_->Status();
+    const auto pending = status.value("recovering", 0);
+    stats_cache_["recovering_connection_count"] = pending;
+    stats_cache_["active_connection_count"] = active_connection_count >= size_t(pending)
+        ? active_connection_count - pending : 0;
+  }
+  return stats_cache_;
+}
+
+AdminHttpResponse AdminController::JsonResponse(
+    int status, const nlohmann::json& body) const {
+  AdminHttpResponse response;
+  response.status = status;
+  response.content_type = JsonContentType();
+  response.headers.push_back({"Cache-Control", "no-store"});
+  response.headers.push_back({"X-Content-Type-Options", "nosniff"});
+  response.body = body.dump();
+  return response;
+}
+
+AdminHttpResponse AdminController::HtmlResponse(
+    int status, const std::string& body) const {
+  AdminHttpResponse response;
+  response.status = status;
+  response.content_type = "text/html; charset=utf-8";
+  response.headers.push_back({"Cache-Control", "no-store"});
+  response.headers.push_back({"Content-Security-Policy",
+      "default-src 'self'; script-src 'self'; style-src 'self'; "
+      "frame-ancestors 'none'; base-uri 'none'; form-action 'self'"});
+  response.headers.push_back({"Referrer-Policy", "no-referrer"});
+  response.body = body;
+  return response;
+}
+
+AdminHttpResponse AdminController::ErrorResponse(
+    int status, const std::string& error) const {
+  return JsonResponse(status, {{"ok", false}, {"error", error}});
+}

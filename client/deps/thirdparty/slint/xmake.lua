@@ -1,0 +1,106 @@
+package("slint")
+    set_homepage("https://slint.dev")
+    set_description("Declarative GUI toolkit for C++")
+    set_license("GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0")
+
+    add_urls("https://github.com/slint-ui/slint/archive/refs/tags/v$(version).tar.gz",
+             "https://github.com/slint-ui/slint.git")
+    add_versions("1.17.1", "68222567f8c70ff677cd4a98cd94fb4765ac0f797eb8f8608a646911c908dc2a")
+
+    if is_plat("linux") then
+        -- Slint 1.17.1 only exposes a context-wide xdg app id. Keep a window
+        -- override through deferred native creation and hide/show on both
+        -- X11 and Wayland. Include the extension in the package cache key.
+        add_configs("per_window_xdg_app_id", {description = "Support per-window XDG application IDs", default = true, type = "boolean", readonly = true})
+        add_patches("1.17.1", path.join(os.scriptdir(), "patches/1.17.1-per-window-xdg-app-id.patch"),
+            "86aedd42960c6e1b0f9d2a37ee5681bff177f166ee7aa77fee4b18c72fbff3d3")
+    elseif is_plat("macosx") then
+        -- AccessKit/accesskit#835 preserves AppKit's KVO subclass when an
+        -- observed Slint window closes. Keep the fixed runtime in its own cache.
+        add_configs("accesskit_macos_kvo", {description = "Preserve AppKit observers on window teardown", default = true, type = "boolean", readonly = true})
+        add_patches("1.17.1", path.join(os.scriptdir(), "patches/1.17.1-macos-accesskit-kvo.patch"),
+            "ed51c3125bad6a69fe5dcf212c5c8a0c360ab97c6e1095afe7e10bd5ec3b1b96")
+    end
+
+    add_configs("shared", {description = "Build the Slint runtime as a shared library", default = true, type = "boolean", readonly = true})
+    if is_plat("windows") then
+        -- Include CRT linkage in the package hash so cached /MD builds are not reused.
+        add_configs("static_crt", {description = "Statically link the Windows C runtime", default = true, type = "boolean", readonly = true})
+    end
+
+    add_deps("cmake~slint >=3.21 <4.0", {host = true, private = true, system = false})
+    add_deps("rust 1.92.0", {host = true, private = true, system = false})
+
+    on_load(function(package)
+        if package:is_plat("linux") then
+            package:add("deps", "fontconfig", {private = true, system = false})
+        end
+        package:add("includedirs", "include/slint")
+        if package:is_plat("windows") then
+            package:add("links", "slint_cpp.dll")
+        else
+            package:add("links", "slint_cpp")
+        end
+    end)
+
+    on_install("windows", "linux", "macosx", function(package)
+        for _, dep in ipairs(package:orderdeps()) do
+            if dep:name() == "cmake" and dep:label() == "slint" then
+                os.addenv("PATH", dep:installdir("bin"))
+                import("core.cache.detectcache"):set2("find_program", "cmake", nil)
+                break
+            end
+        end
+        local use_macos_metal = package:is_plat("macosx")
+        local configs = {
+            "-DSLINT_BUILD_TESTING=OFF",
+            "-DSLINT_BUILD_EXAMPLES=OFF",
+            "-DSLINT_FEATURE_INTERPRETER=OFF",
+            "-DSLINT_FEATURE_LIVE_PREVIEW=OFF",
+            "-DSLINT_FEATURE_TESTING=OFF",
+            "-DSLINT_FEATURE_SYSTEM_TESTING=OFF",
+            "-DSLINT_FEATURE_MCP=OFF",
+            "-DSLINT_FEATURE_BACKEND_QT=OFF",
+            "-DSLINT_FEATURE_RENDERER_SKIA=" .. (use_macos_metal and "ON" or "OFF"),
+            "-DSLINT_FEATURE_RENDERER_SKIA_OPENGL=OFF",
+            "-DSLINT_FEATURE_RENDERER_SKIA_VULKAN=OFF",
+            "-DSLINT_FEATURE_RENDERER_FEMTOVG=" .. (use_macos_metal and "OFF" or "ON"),
+            "-DSLINT_FEATURE_RENDERER_FEMTOVG_WGPU=OFF",
+            "-DSLINT_FEATURE_RENDERER_SOFTWARE=ON",
+            "-DSLINT_STYLE=fluent",
+            "-DBUILD_SHARED_LIBS=ON"
+        }
+        local cmake = import("package.tools.cmake")
+        local envs
+        if package:is_plat("windows") then
+            local rc = assert(package:build_getenv("mrc"),
+                "failed to find the Windows resource compiler")
+            rc = rc:gsub("\\", "/")
+            table.insert(configs, "-DCMAKE_RC_COMPILER=" .. rc)
+            table.insert(configs, "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
+
+            -- Slint is a Rust cdylib: CMake's /MT setting alone does not affect it.
+            -- Encoded flags take precedence over RUSTFLAGS set by Corrosion.
+            envs = cmake.buildenvs(package)
+            local rustflags = os.getenv("CARGO_ENCODED_RUSTFLAGS")
+            if rustflags == nil then
+                rustflags = table.concat((os.getenv("RUSTFLAGS") or ""):split("%s+"), "\31")
+            end
+            envs.CARGO_ENCODED_RUSTFLAGS = (rustflags ~= "" and rustflags .. "\31" or "") ..
+                "-Ctarget-feature=+crt-static"
+        elseif package:is_plat("macosx") then
+            -- Rust 1.92's implicit debuginfo stripping can misalign Mach-O
+            -- LINKEDIT string pools, which macOS 27 rejects (rust-lang/rust#157750).
+            -- Set both profiles explicitly, including their build dependencies.
+            envs = cmake.buildenvs(package)
+            envs.CARGO_PROFILE_RELEASE_STRIP = "none"
+            envs.CARGO_PROFILE_DEV_STRIP = "none"
+        end
+        cmake.install(package, configs, {envs = envs})
+    end)
+
+    on_test(function(package)
+        assert(package:has_cxxincludes("slint.h", {configs = {languages = "c++20"}}), "Slint C++ compile/link check failed")
+        assert(os.isfile(path.join(package:installdir(), "bin", is_host("windows") and "slint-compiler.exe" or "slint-compiler")), "slint-compiler was not installed")
+    end)
+package_end()

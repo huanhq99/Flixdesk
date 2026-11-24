@@ -1,0 +1,270 @@
+import { SurfaceSeparator, FlatSurface, UiSurface } from "ui_surface.slint";
+import { UiRadius } from "ui_radius.slint";
+import { ScrollView } from "std-widgets.slint";
+import { IconButton, FontAwesomeIcons, ControlStyle } from "common.slint";
+import { SettingsDialog, SettingsButton } from "settings_controls.slint";
+import { WorkbenchStyle } from "workbench_controls.slint";
+import "../assets/fonts/message_spacing.ttf";
+
+export struct AnnouncementItem {
+    id: string,
+    revision: string,
+    title: string,
+    date: string,
+    read: bool,
+}
+
+export global MessageStrings {
+    in-out property <string> messages: "Messages";
+    in-out property <string> unread: "Unread";
+    in-out property <string> read: "Read";
+    in-out property <string> read-all: "Mark all as read";
+    in-out property <string> empty: "No announcements";
+    in-out property <string> select-message: "Select an announcement to read";
+    in-out property <string> loading: "Loading…";
+    in-out property <string> read-save-error: "Unable to save reading status locally. Please try again.";
+    in-out property <string> close: "Close";
+    in-out property <string> delete-message: "Delete";
+    in-out property <string> delete-title: "Delete announcement";
+    in-out property <string> delete-confirmation: "Delete this announcement?";
+    in-out property <string> delete-error: "Unable to delete this announcement. Please try again.";
+    in-out property <string> cancel: "Cancel";
+}
+
+export component MessagePanel inherits SettingsDialog {
+    in property <[AnnouncementItem]> items;
+    in property <int> unread-count;
+    in property <int> total;
+    in property <bool> loading;
+    in property <bool> failed;
+    in property <bool> read-save-failed;
+    in property <bool> delete-failed;
+    in property <bool> loaded;
+    in property <bool> connected;
+    in property <string> selected-id;
+    in property <string> selected-revision;
+    in property <string> selected-title;
+    in property <styled-text> selected-body;
+    in property <string> selected-date;
+    in property <bool> selected-read;
+    callback open-message(string, string);
+    callback open-link(string);
+    callback delete-message(string, string);
+    callback load-more;
+    callback read-all;
+    private property <string> notice-text: root.delete-failed ? MessageStrings.delete-error
+        : root.read-save-failed ? MessageStrings.read-save-error : "";
+    private property <string> pending-delete-id;
+    private property <string> pending-delete-revision;
+    function request-delete(id: string, revision: string) {
+        root.pending-delete-id = id;
+        root.pending-delete-revision = revision;
+        confirmation-keys.focus();
+    }
+    confirmation-keys := FocusScope {
+        width: 0px; height: 0px;
+        key-pressed(event) => {
+            if event.text == Key.Escape {
+                if root.pending-delete-id != "" { root.pending-delete-id = ""; }
+                else { root.close(); }
+                return accept;
+            }
+            return reject;
+        }
+    }
+    title: MessageStrings.messages;
+    close-label: MessageStrings.close;
+    badge-count: root.unread-count;
+    badge-label: MessageStrings.unread + " " + root.unread-count;
+    header-status: root.loading ? MessageStrings.loading : "";
+    action-text: MessageStrings.read-all;
+    action-enabled: root.loaded && !root.loading && root.unread-count > 0;
+    action => { root.read-all(); }
+    notice := Rectangle {
+        x: 24px; y: root.content-top; width: parent.width - 48px;
+        height: root.notice-text == "" ? 0px : notice-label.preferred-height + 20px;
+        visible: root.notice-text != "";
+        border-radius: UiRadius.control; background: #fef2f2;
+        notice-label := Text {
+            x: 10px; y: 10px; width: parent.width - 20px;
+            height: self.preferred-height;
+            text: root.notice-text; font-size: 12px; wrap: word-wrap; color: #b3261e;
+        }
+    }
+    message-content := FlatSurface {
+        x: 24px; y: root.content-top + (root.notice-text == "" ? 0px : notice.height + 12px);
+        width: parent.width - 48px; height: parent.height - self.y - 24px;
+        background: WorkbenchStyle.surface;
+        border-radius: UiRadius.surface; outline-color: UiSurface.edge;
+        if root.items.length > 0 || root.selected-id != "": Rectangle {
+            x: 1px; y: 1px; width: content-divider.x - 1px; height: parent.height - 2px;
+            background: WorkbenchStyle.field-surface;
+            border-top-left-radius: UiRadius.surface - 1px;
+            border-bottom-left-radius: UiRadius.surface - 1px;
+        }
+        announcement-list := Rectangle {
+            x: 8px; y: 8px; width: 176px; height: parent.height - 16px;
+            announcements-scroll := ScrollView {
+                width: parent.width; height: parent.height;
+                viewport-width: self.width - 10px;
+                viewport-height: announcement-entries.preferred-height;
+                horizontal-scrollbar-policy: always-off;
+                vertical-scrollbar-policy: as-needed;
+                announcement-entries := VerticalLayout {
+                    width: announcements-scroll.viewport-width; spacing: 10px; padding: 0px;
+                    alignment: start;
+                    for item in root.items: FlatSurface {
+                        height: 64px;
+                        background: root.selected-id == item.id
+                            ? (entry-touch.pressed ? ControlStyle.selected-pressed : entry-touch.has-hover ? ControlStyle.selected-hover : ControlStyle.selected)
+                            : entry-touch.pressed ? WorkbenchStyle.pressed-surface
+                            : entry-touch.has-hover ? WorkbenchStyle.hover-surface : WorkbenchStyle.surface;
+                        border-radius: UiRadius.control;
+                        outline-color: root.selected-id == item.id ? UiSurface.focus : UiSurface.edge;
+                        Text {
+                            x: 10px; y: 9px; width: parent.width - 30px; height: 20px;
+                            text: item.title; overflow: elide; font-size: 13px;
+                            font-weight: item.read ? 400 : 600;
+                            color: root.selected-id == item.id ? ControlStyle.selected-text : WorkbenchStyle.text;
+                            vertical-alignment: center;
+                        }
+                        if !item.read: Rectangle {
+                            x: parent.width - 15px; y: 16px; width: 6px; height: 6px;
+                            border-radius: 3px; background: WorkbenchStyle.accent;
+                            accessible-role: none;
+                        }
+                        Text {
+                            x: 10px; y: 35px; width: parent.width - 20px; height: 18px;
+                            text: item.date; color: WorkbenchStyle.muted; font-size: 11px;
+                            overflow: elide; vertical-alignment: center;
+                        }
+                        accessible-role: button;
+                        accessible-label: item.title + " " + (item.read ? MessageStrings.read : MessageStrings.unread);
+                        accessible-action-default => { root.open-message(item.id, item.revision); }
+                        entry-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.open-message(item.id, item.revision); }
+                        }
+                    }
+                }
+            }
+        }
+        if root.items.length == 0 && root.total == 0 && root.loaded && root.connected && !root.loading && !root.failed: Text {
+            x: 24px; width: parent.width - 48px; height: parent.height;
+            text: MessageStrings.empty; wrap: word-wrap;
+            color: WorkbenchStyle.muted; font-size: 13px;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        content-divider := SurfaceSeparator {
+            x: announcement-list.x + announcement-list.width + 8px;
+            y: 1px; width: 1px; height: parent.height - 2px;
+            vertical: true; outline-color: UiSurface.separator;
+            visible: root.items.length > 0 || root.selected-id != "";
+            accessible-role: none;
+        }
+        announcement-details := Rectangle {
+            x: content-divider.x + 17px; y: 16px;
+            width: parent.width - self.x - 16px; height: parent.height - 32px;
+            clip: true;
+            if root.selected-id == "" && root.items.length > 0: Text {
+                width: parent.width; height: parent.height;
+                text: MessageStrings.select-message; color: WorkbenchStyle.muted; font-size: 13px;
+                wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center;
+            }
+            if root.selected-id != "": details-scroll := ScrollView {
+                width: parent.width; height: parent.height;
+                viewport-width: self.width - 12px;
+                viewport-height: details-content.preferred-height;
+                horizontal-scrollbar-policy: always-off;
+                vertical-scrollbar-policy: as-needed;
+                details-content := VerticalLayout {
+                    width: details-scroll.viewport-width; padding: 0px; padding-bottom: 4px;
+                    spacing: 14px; alignment: start;
+                    Rectangle {
+                        height: max(28px, selected-heading.preferred-height);
+                        selected-heading := VerticalLayout {
+                            x: 0px; y: 0px;
+                            width: parent.width - 40px; height: self.preferred-height;
+                            padding: 0px; spacing: 6px;
+                            Text {
+                                vertical-stretch: 0; text: root.selected-title; wrap: word-wrap;
+                                font-size: 16px; font-weight: 600; color: WorkbenchStyle.text;
+                            }
+                            Text {
+                                vertical-stretch: 0; text: root.selected-date;
+                                accessible-label: root.selected-date + " · " + (root.selected-read ? MessageStrings.read : MessageStrings.unread);
+                                color: WorkbenchStyle.muted; font-size: 11px; wrap: word-wrap;
+                            }
+                        }
+                        IconButton {
+                            x: parent.width - self.width; y: 0px; width: 28px; height: 28px;
+                            icon: FontAwesomeIcons.trash-can; icon-size: 12px;
+                            icon-color: WorkbenchStyle.muted; danger: true;
+                            normal-background: ControlStyle.surface;
+                            accessible-role: button;
+                            accessible-label: MessageStrings.delete-message + " " + root.selected-title;
+                            accessible-action-default => { root.request-delete(root.selected-id, root.selected-revision); }
+                            clicked => { root.request-delete(root.selected-id, root.selected-revision); }
+                        }
+                    }
+                    SurfaceSeparator { height: 1px; outline-color: UiSurface.separator; }
+                    StyledText {
+                        vertical-stretch: 0;
+                        text: root.selected-body;
+                        default-color: WorkbenchStyle.text; default-font-size: 13px;
+                        // Metrics-only family provides 1.5em line height; visible
+                        // glyphs continue to use Slint's normal font fallback.
+                        default-font-family: "CrossDesk Message Spacing";
+                        link-color: WorkbenchStyle.accent;
+                        link-clicked(url) => { root.open-link(url); }
+                    }
+                }
+            }
+        }
+    }
+    Timer {
+        interval: 100ms;
+        running: root.connected && !root.loading && !root.failed
+            && root.pending-delete-id == "" && root.items.length > 0
+            && root.items.length < root.total && announcements-scroll.viewport-height > 0px
+            && announcements-scroll.viewport-height + announcements-scroll.viewport-y <= announcements-scroll.height + 80px;
+        triggered => { root.load-more(); }
+    }
+    if root.pending-delete-id != "": Rectangle {
+        background: #15223850; border-radius: root.border-radius; z: 30;
+        TouchArea { clicked => { confirmation-keys.focus(); } }
+        SettingsDialog {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: min(360px, root.width - 48px);
+            height: self.content-top + confirmation-content.preferred-height + 24px;
+            title: MessageStrings.delete-title;
+            close-label: MessageStrings.cancel;
+            close => { root.pending-delete-id = ""; }
+            confirmation-content := VerticalLayout {
+                x: 24px; y: parent.content-top; width: parent.width - 48px;
+                height: self.preferred-height;
+                padding: 0px; spacing: 24px;
+                Text { text: MessageStrings.delete-confirmation; font-size: 13px; color: WorkbenchStyle.text; wrap: word-wrap; }
+                HorizontalLayout {
+                    alignment: end; spacing: 8px;
+                    cancel-delete-button := SettingsButton {
+                        width: 88px; text: MessageStrings.cancel;
+                        accessible-role: button; accessible-label: MessageStrings.cancel;
+                        accessible-action-default => { cancel-delete-button.clicked(); }
+                        clicked => { root.pending-delete-id = ""; }
+                    }
+                    confirm-delete-button := SettingsButton {
+                        width: 88px; text: MessageStrings.delete-message; primary: true;
+                        accessible-role: button; accessible-label: MessageStrings.delete-title;
+                        accessible-action-default => { confirm-delete-button.clicked(); }
+                        clicked => {
+                            root.delete-message(root.pending-delete-id, root.pending-delete-revision);
+                            root.pending-delete-id = "";
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

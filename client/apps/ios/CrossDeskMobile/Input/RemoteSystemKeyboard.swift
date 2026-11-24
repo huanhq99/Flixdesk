@@ -1,0 +1,711 @@
+import SwiftUI
+import UIKit
+
+/// UIKit owns composition, candidate selection, keyboard switching and dictation.
+/// Confirmed text is mirrored to the remote app; preedit stays in the IME.
+struct RemoteSystemKeyboard: View {
+    @ObservedObject var session: RemoteSessionModel
+    @StateObject private var keyboard = RemoteKeyboardController()
+    var inputContext: RemoteKeyboardInputContext? = nil
+    var geometry: RemoteKeyboardGeometry? = nil
+    var animatePresentation = true
+    var didPresent: () -> Void = {}
+    var shortcuts: [RemoteShortcut] = []
+    var sendShortcut: (RemoteShortcut) -> Void = { _ in }
+    var showShortcuts: () -> Void = {}
+    let switchKeyboard: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        RemoteKeyboardHost(
+            controller: keyboard,
+            edit: session.sendSystemTextEdit,
+            inputContext: inputContext,
+            geometry: geometry,
+            animatePresentation: animatePresentation,
+            didPresent: didPresent,
+            key: session.sendKeyStroke,
+            status: session.keyboardInputStatus,
+            shortcuts: shortcuts,
+            sendShortcut: sendShortcut,
+            showShortcuts: showShortcuts,
+            inputBlocked: { session.showKeyboardCompositionHint() },
+            inputReady: session.clearKeyboardInputStatus,
+            switchKeyboard: switchKeyboard,
+            dismiss: dismiss
+        )
+        // The native host tracks the keyboard itself, including its animation.
+        // SwiftUI must not also resize it to the keyboard's safe area.
+        .ignoresSafeArea()
+        .onDisappear { keyboard.stop() }
+    }
+}
+
+private struct RemoteKeyboardHost: UIViewControllerRepresentable {
+    @Environment(\.colorScheme) private var colorScheme
+    let controller: RemoteKeyboardController
+    let edit: (Int, String) -> Bool
+    let inputContext: RemoteKeyboardInputContext?
+    let geometry: RemoteKeyboardGeometry?
+    let animatePresentation: Bool
+    let didPresent: () -> Void
+    let key: (UInt) -> Void
+    let status: String
+    let shortcuts: [RemoteShortcut]
+    let sendShortcut: (RemoteShortcut) -> Void
+    let showShortcuts: () -> Void
+    let inputBlocked: () -> Void
+    let inputReady: () -> Void
+    let switchKeyboard: () -> Void
+    let dismiss: () -> Void
+
+    func makeUIViewController(context: Context) -> RemoteKeyboardController {
+        update(controller)
+        return controller
+    }
+
+    func updateUIViewController(_ controller: RemoteKeyboardController,
+                                context: Context) {
+        update(controller)
+    }
+
+    private func update(_ controller: RemoteKeyboardController) {
+        controller.editor.applyEdit = edit
+        inputContext?.editor = controller.editor
+        controller.geometry = geometry
+        geometry?.systemInputBar = controller.inputBar
+        controller.animatePresentation = animatePresentation
+        controller.didPresent = didPresent
+        controller.editor.key = key
+        let prepareShortcut: () -> Bool = { [weak controller] in
+            guard let controller else { return false }
+            if controller.editor.markedTextRange != nil { inputBlocked(); return false }
+            guard controller.editor.prepareShortcut() else { return false }
+            inputReady()
+            return true
+        }
+        controller.inputBar.switchKeyboard = { [weak controller] in
+            guard let controller, prepareShortcut() else { return }
+            controller.rememberKeyboardHeight()
+            // Let SwiftUI install the replacement panel before teardown hides
+            // the native keyboard, avoiding an empty frame between the two.
+            controller.animateDismissal = false
+            switchKeyboard()
+        }
+        controller.inputBar.showShortcuts = { [weak controller] in
+            guard let controller, prepareShortcut() else { return }
+            controller.rememberKeyboardHeight()
+            controller.animateDismissal = false
+            showShortcuts()
+        }
+        controller.inputBar.sendShortcut = { item in
+            guard prepareShortcut() else { return }
+            sendShortcut(item)
+        }
+        controller.inputBar.setShortcuts(shortcuts)
+        controller.inputBar.dismiss = { [weak controller] in
+            controller?.stop()
+            dismiss()
+        }
+        controller.overrideUserInterfaceStyle = colorScheme == .dark ? .dark : .light
+        controller.inputBar.setStatus(status)
+    }
+
+    static func dismantleUIViewController(_ controller: RemoteKeyboardController,
+                                          coordinator: ()) {
+        controller.stop()
+    }
+}
+
+final class RemoteKeyboardController: UIViewController, ObservableObject {
+    let editor: RemoteTextInputView
+    let inputBar: RemoteKeyboardInputBar
+    var geometry: RemoteKeyboardGeometry?
+    var animatePresentation = true
+    var animateDismissal = true
+    var didPresent: (() -> Void)?
+    private var acceptingInput = true
+    private var animationsEnabledBeforePresentation: Bool?
+
+    init() {
+        let editor = RemoteTextInputView()
+        editor.automaticallyFocus = false
+        self.editor = editor
+        self.inputBar = RemoteKeyboardInputBar()
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func loadView() {
+        let host = RemoteKeyboardHostView()
+        host.willDetach = { [weak self] in self?.stop() }
+        view = host
+        view.backgroundColor = .clear
+        host.inputBar = inputBar
+        inputBar.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(inputBar)
+        // Keep a real UITextField for IME and dictation context, but never
+        // display a second copy of the remote text or a local caret.
+        editor.isAccessibilityElement = false
+        editor.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(editor)
+
+        // Keep one continuous background behind the row and the system
+        // keyboard's rounded corners, without reserving an input accessory slot.
+        let backdrop = UIView()
+        backdrop.backgroundColor = RemoteKeyboardInputBar.keyboardBackground
+        backdrop.isUserInteractionEnabled = false
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        host.insertSubview(backdrop, at: 0)
+        NSLayoutConstraint.activate([
+            editor.leadingAnchor.constraint(equalTo: inputBar.leadingAnchor),
+            editor.topAnchor.constraint(equalTo: inputBar.topAnchor),
+            editor.widthAnchor.constraint(equalToConstant: 1),
+            editor.heightAnchor.constraint(equalToConstant: 1),
+            inputBar.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            inputBar.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            inputBar.bottomAnchor.constraint(equalTo: host.keyboardLayoutGuide.topAnchor),
+            backdrop.topAnchor.constraint(equalTo: inputBar.topAnchor),
+            backdrop.leadingAnchor.constraint(equalTo: host.leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: host.bottomAnchor)
+        ])
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        guard acceptingInput, !editor.isFirstResponder else { return }
+        if animatePresentation {
+            editor.becomeFirstResponder()
+        } else {
+            // UIKit may start showing the keyboard after becomeFirstResponder
+            // returns. Keep this short suppression alive until it is shown,
+            // rather than ending it at the end of a synchronous animation block.
+            animationsEnabledBeforePresentation = UIView.areAnimationsEnabled
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(finishKeyboardPresentation),
+                name: UIResponder.keyboardDidShowNotification, object: nil)
+            UIView.setAnimationsEnabled(false)
+            if !editor.becomeFirstResponder() {
+                finishKeyboardPresentation()
+            }
+            view.layoutIfNeeded()
+            // A hardware keyboard or an interrupted focus request may produce
+            // no did-show notification. Always restore the previous state.
+            // Retain the controller until cleanup even if its host disappears.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.finishKeyboardPresentation()
+            }
+        }
+    }
+
+    @objc private func finishKeyboardPresentation() {
+        guard let enabled = animationsEnabledBeforePresentation else { return }
+        animationsEnabledBeforePresentation = nil
+        NotificationCenter.default.removeObserver(
+            self, name: UIResponder.keyboardDidShowNotification, object: nil)
+        UIView.setAnimationsEnabled(enabled)
+        if acceptingInput {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.acceptingInput else { return }
+                self.didPresent?()
+            }
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        rememberKeyboardHeight()
+    }
+
+    func rememberKeyboardHeight() {
+        guard acceptingInput, editor.isFirstResponder else { return }
+        let keyboard = view.keyboardLayoutGuide.layoutFrame
+        // Ignore hidden, floating and split keyboards: they do not define a
+        // full-width docked panel that the computer keyboard can replace.
+        guard keyboard.height > 100,
+              keyboard.width >= view.bounds.width - 1 else { return }
+        geometry?.remember(height: view.bounds.maxY - keyboard.minY +
+                            RemoteKeyboardInputBar.barHeight,
+                           size: view.bounds.size)
+    }
+
+    func stop() {
+        guard acceptingInput else { return }
+        acceptingInput = false
+        finishKeyboardPresentation()
+        editor.stop()
+        inputBar.switchKeyboard = nil
+        inputBar.showShortcuts = nil
+        inputBar.sendShortcut = nil
+        inputBar.dismiss = nil
+        let dismiss = {
+            self.editor.resignFirstResponder()
+            self.editor.removeFromSuperview()
+        }
+        if animateDismissal {
+            dismiss()
+        } else {
+            UIView.performWithoutAnimation(dismiss)
+        }
+    }
+}
+
+/// Retain the last native height for each window width and orientation, even
+/// after the text field resigns first responder during a keyboard switch.
+final class RemoteKeyboardGeometry: ObservableObject {
+    private var heights: [String: CGFloat] = [:]
+    weak var systemInputBar: UIView?
+    weak var computerPanel: UIView?
+
+    func visibleHeight(in surface: UIView, at point: CGPoint? = nil) -> CGFloat {
+        guard let window = surface.window else { return surface.bounds.height }
+        var height = surface.bounds.height
+        for case let panel? in [systemInputBar, computerPanel] where panel.window === window {
+            let frame = panel.convert(panel.bounds, to: surface)
+            guard !frame.isEmpty, frame.maxY > 0 else { continue }
+            if let point, point.x < frame.minX || point.x > frame.maxX { continue }
+            height = min(height, max(0, frame.minY))
+        }
+        // On iPad the native keyboard can float independently of the docked toolbar.
+        guard systemInputBar?.window === window else { return height }
+        let frame = surface.keyboardLayoutGuide.layoutFrame
+        guard !frame.isEmpty, frame.minY > 0 else { return height }
+        if let point, point.x < frame.minX || point.x > frame.maxX || point.y >= frame.maxY { return height }
+        return min(height, frame.minY)
+    }
+
+    private func key(for size: CGSize) -> String {
+        "\(Int(size.width.rounded()))-\(size.width > size.height)"
+    }
+
+    func remember(height: CGFloat, size: CGSize) {
+        heights[key(for: size)] = height
+    }
+
+    func panelHeight(in size: CGSize, bottomInset: CGFloat) -> CGFloat {
+        // A rotation may reach a size at which the native keyboard has not yet
+        // appeared. The compact iPhone keybed is 161 points; using the full
+        // 216-point keybed here makes only the first landscape switch jump.
+        // Safe-area and toolbar heights are added separately below.
+        let fallback: CGFloat = size.width > size.height ? 161 : 300
+        let height = heights[key(for: size)] ??
+            (fallback + bottomInset + RemoteKeyboardInputBar.barHeight)
+        return min(height, size.height)
+    }
+}
+
+/// Gives the touch surface the docked panel's actual frame in its own coordinates.
+struct RemoteKeyboardPanelFrame: UIViewRepresentable {
+    let geometry: RemoteKeyboardGeometry
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        geometry.computerPanel = view
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {}
+}
+
+private final class RemoteKeyboardHostView: UIView {
+    var willDetach: (() -> Void)?
+    weak var inputBar: UIView?
+
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard let inputBar else { return nil }
+        // Video gestures outside the input row must reach the remote viewport.
+        return inputBar.hitTest(convert(point, to: inputBar), with: event)
+    }
+
+    override func willMove(toSuperview newSuperview: UIView?) {
+        if newSuperview == nil { willDetach?() }
+        super.willMove(toSuperview: newSuperview)
+    }
+}
+
+/// Both replacement panels use the same edge controls and layout. Only the
+/// center content changes, so switching panels cannot move the return label.
+struct RemoteKeyboardToolbar<Center: View>: View {
+    let switchKeyboard: () -> Void
+    let more: () -> Void
+    var moreAccessibilityLabel = NSLocalizedString("更多快捷键", comment: "")
+    let dismiss: () -> Void
+    var dismissAccessibilityLabel = NSLocalizedString("收起键盘", comment: "")
+    @ViewBuilder var center: () -> Center
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Button(NSLocalizedString("系统键盘", comment: ""), action: switchKeyboard)
+                .font(.system(size: 15, weight: .medium))
+                .frame(minWidth: 80, minHeight: 44)
+                .fixedSize(horizontal: true, vertical: false)
+                .accessibilityLabel(NSLocalizedString("切换到系统键盘", comment: ""))
+            center()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Button(action: more) {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 17))
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel(moreAccessibilityLabel)
+            RemoteKeyboardDismissButton(accessibilityLabel: dismissAccessibilityLabel, action: dismiss)
+                .frame(width: 44, height: 44)
+        }
+        .padding(.horizontal, 4)
+        .frame(height: 44)
+        .foregroundStyle(Color(uiColor: .label))
+        .buttonStyle(.plain)
+    }
+}
+
+/// Use the same UIKit symbol layout in both the native and SwiftUI toolbars.
+/// Matching font sizes alone still gives their symbols different baselines.
+struct RemoteKeyboardDismissButton: UIViewRepresentable {
+    static let sideLength: CGFloat = 44
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    static func makeButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.tintColor = .label
+        button.setImage(UIImage(systemName: "keyboard.chevron.compact.down"), for: .normal)
+        button.setPreferredSymbolConfiguration(
+            UIImage.SymbolConfiguration(pointSize: 20, weight: .regular, scale: .medium),
+            forImageIn: .normal)
+        button.contentHorizontalAlignment = .center
+        button.contentVerticalAlignment = .center
+        return button
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(action: action) }
+
+    func makeUIView(context: Context) -> UIButton {
+        let button = Self.makeButton()
+        button.addTarget(context.coordinator, action: #selector(Coordinator.pressed),
+                         for: .touchUpInside)
+        return button
+    }
+
+    func updateUIView(_ button: UIButton, context: Context) {
+        button.accessibilityLabel = accessibilityLabel
+        context.coordinator.action = action
+    }
+
+    final class Coordinator: NSObject {
+        var action: () -> Void
+
+        init(action: @escaping () -> Void) { self.action = action }
+
+        @objc func pressed() { action() }
+    }
+}
+
+final class RemoteKeyboardInputBar: UIView {
+    static let barHeight: CGFloat = 44
+    static let keyboardBackground = UIColor { traits in
+        traits.userInterfaceStyle == .dark ? .secondarySystemBackground : .systemGray4
+    }
+    var switchKeyboard: (() -> Void)?
+    var showShortcuts: (() -> Void)?
+    var sendShortcut: ((RemoteShortcut) -> Void)?
+    var dismiss: (() -> Void)?
+    private let shortcutRow = UIStackView()
+    private var shortcuts: [RemoteShortcut] = []
+    private let statusLabel = UILabel()
+    private let row = UIStackView()
+    private var status = ""
+    private var statusHeight: CGFloat = 0
+    private var heightConstraint: NSLayoutConstraint!
+
+    init() {
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        tintColor = .label
+        heightConstraint = heightAnchor.constraint(equalToConstant: Self.barHeight)
+        heightConstraint.isActive = true
+
+        let computerButton = UIButton(type: .system)
+        computerButton.setTitle(NSLocalizedString("电脑键盘", comment: ""), for: .normal)
+        computerButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .medium)
+        computerButton.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        computerButton.accessibilityLabel = NSLocalizedString("切换到电脑键盘", comment: "")
+        computerButton.addTarget(self, action: #selector(switchToComputer), for: .touchUpInside)
+
+        let dismissButton = RemoteKeyboardDismissButton.makeButton()
+        dismissButton.accessibilityLabel = NSLocalizedString("收起系统键盘", comment: "")
+        dismissButton.addTarget(self, action: #selector(hideKeyboard), for: .touchUpInside)
+
+        let moreButton = UIButton(type: .system)
+        moreButton.setImage(UIImage(systemName: "ellipsis"), for: .normal)
+        moreButton.accessibilityLabel = NSLocalizedString("更多快捷键", comment: "")
+        moreButton.addTarget(self, action: #selector(openShortcuts), for: .touchUpInside)
+        let scroll = UIScrollView()
+        scroll.showsHorizontalScrollIndicator = false
+        shortcutRow.axis = .horizontal
+        shortcutRow.spacing = 2
+        shortcutRow.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(shortcutRow)
+        NSLayoutConstraint.activate([
+            shortcutRow.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            shortcutRow.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            shortcutRow.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            shortcutRow.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            shortcutRow.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor),
+            moreButton.widthAnchor.constraint(equalToConstant: 44)
+        ])
+
+        row.axis = .horizontal
+        row.alignment = .fill
+        row.spacing = 4
+        for item in [computerButton, scroll, moreButton, dismissButton] { row.addArrangedSubview(item) }
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            // Keep the minimum touch width while allowing longer translations.
+            computerButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 80),
+            dismissButton.widthAnchor.constraint(equalToConstant: RemoteKeyboardDismissButton.sideLength),
+            row.leadingAnchor.constraint(equalTo: safeAreaLayoutGuide.leadingAnchor, constant: 4),
+            row.trailingAnchor.constraint(equalTo: safeAreaLayoutGuide.trailingAnchor, constant: -4),
+            row.bottomAnchor.constraint(equalTo: bottomAnchor),
+            row.heightAnchor.constraint(equalToConstant: Self.barHeight)
+        ])
+
+        statusLabel.font = .systemFont(ofSize: 12)
+        statusLabel.textColor = .secondaryLabel
+        statusLabel.numberOfLines = 0
+        statusLabel.isHidden = true
+        addSubview(statusLabel)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var intrinsicContentSize: CGSize {
+        CGSize(width: UIView.noIntrinsicMetric, height: Self.barHeight + statusHeight)
+    }
+
+    func setStatus(_ value: String) {
+        guard status != value else { return }
+        status = value
+        statusLabel.text = value
+        statusLabel.isHidden = value.isEmpty
+        setNeedsLayout()
+    }
+
+    func setShortcuts(_ items: [RemoteShortcut]) {
+        guard items != shortcuts else { return }
+        shortcuts = items
+        for child in shortcutRow.arrangedSubviews { shortcutRow.removeArrangedSubview(child); child.removeFromSuperview() }
+        for item in items {
+            let button = UIButton(type: .system)
+            button.setTitle(item.title, for: .normal)
+            button.titleLabel?.font = .systemFont(ofSize: 13)
+            button.accessibilityLabel = item.title + ", " + item.chord
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+            button.addAction(UIAction { [weak self] _ in
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                self?.sendShortcut?(item)
+            }, for: .touchUpInside)
+            shortcutRow.addArrangedSubview(button)
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let inset = max(8, safeAreaInsets.left)
+        let width = max(1, bounds.width - inset - max(8, safeAreaInsets.right))
+        let height = status.isEmpty ? 0 : ceil(statusLabel.sizeThatFits(
+            CGSize(width: width, height: .greatestFiniteMagnitude)).height) + 4
+        statusLabel.frame = CGRect(x: inset, y: 2, width: width, height: max(0, height - 4))
+        if statusHeight != height {
+            statusHeight = height
+            heightConstraint.constant = Self.barHeight + height
+            invalidateIntrinsicContentSize()
+        }
+    }
+
+    @objc private func switchToComputer() { switchKeyboard?() }
+    @objc private func openShortcuts() { showShortcuts?() }
+    @objc private func hideKeyboard() { dismiss?() }
+}
+
+/// Resets the local IME context synchronously before a remote click can move
+/// the insertion point. Nothing typed at the old location may be rewritten there.
+final class RemoteKeyboardInputContext: ObservableObject {
+    weak var editor: RemoteTextInputView?
+
+    func remoteFocusWillChange() {
+        editor?.finishInputContext()
+    }
+}
+
+final class RemoteTextInputView: UITextField, UITextFieldDelegate {
+    var applyEdit: ((Int, String) -> Bool)?
+    var key: ((UInt) -> Void)?
+    private(set) var acceptingInput = true
+    var automaticallyFocus = true
+    private var sentText = ""
+    private var committedText = ""
+    private var changeScheduled = false
+    private var resetting = false
+    private var generation: UInt64 = 0
+
+    override var canBecomeFirstResponder: Bool { acceptingInput && super.canBecomeFirstResponder }
+
+    init() {
+        super.init(frame: .zero)
+        delegate = self
+        textColor = .clear
+        tintColor = .clear
+        backgroundColor = .clear
+        borderStyle = .none
+        keyboardType = .default
+        returnKeyType = .default
+        autocorrectionType = .default
+        autocapitalizationType = .none
+        spellCheckingType = .default
+        smartQuotesType = .no
+        smartDashesType = .no
+        smartInsertDeleteType = .no
+        inputAssistantItem.leadingBarButtonGroups = []
+        inputAssistantItem.trailingBarButtonGroups = []
+        addTarget(self, action: #selector(scheduleTextChange), for: .editingChanged)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil && acceptingInput && automaticallyFocus { becomeFirstResponder() }
+    }
+
+    override func caretRect(for position: UITextPosition) -> CGRect { .zero }
+    override func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+
+    func textFieldDidChangeSelection(_ textField: UITextField) { scheduleTextChange() }
+
+    override func insertText(_ text: String) {
+        guard acceptingInput else { return }
+        if (text == "\n" || text == "\r") && markedTextRange == nil {
+            _ = textFieldShouldReturn(self)
+            return
+        }
+        super.insertText(text)
+        scheduleTextChange()
+    }
+
+    override func replace(_ range: UITextRange, withText text: String) {
+        guard acceptingInput else { return }
+        super.replace(range, withText: text)
+        scheduleTextChange()
+    }
+
+    override func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        guard acceptingInput else { return }
+        // Preserve the last commit even if the next preedit starts in this run-loop turn.
+        if markedTextRange == nil { committedText = text ?? "" }
+        super.setMarkedText(markedText, selectedRange: selectedRange)
+        scheduleTextChange()
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        scheduleTextChange()
+    }
+
+    override func deleteBackward() {
+        guard acceptingInput else { return }
+        if !hasText && markedTextRange == nil {
+            // Flush any pending deletion before deleting beyond local context.
+            if synchronizeText() { key?(0x08) }
+        } else {
+            super.deleteBackward()
+            scheduleTextChange()
+        }
+    }
+
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        guard acceptingInput, markedTextRange == nil else { return false }
+        if synchronizeText() {
+            key?(0x0d)
+            resetContext()
+        }
+        return false
+    }
+
+    @objc private func scheduleTextChange() {
+        guard acceptingInput, !resetting, !changeScheduled else { return }
+        changeScheduled = true
+        let currentGeneration = generation
+        // UIKit may replace text and clear markedTextRange in separate calls.
+        // Wait one run-loop turn so only the completed IME transaction is sent.
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.generation == currentGeneration else { return }
+            self.changeScheduled = false
+            _ = self.synchronizeText()
+        }
+    }
+
+    @discardableResult
+    func synchronizeText() -> Bool {
+        guard acceptingInput, !resetting else { return false }
+        let marked = markedTextRange
+        if let marked {
+            // Some IMEs confirm a prefix by moving the start of the marked range.
+            // Keep the committed tail if an existing word was marked for correction.
+            if let range = textRange(from: beginningOfDocument, to: marked.start),
+               let prefix = text(in: range), prefix.hasPrefix(committedText) {
+                committedText = prefix
+            }
+        } else {
+            committedText = text ?? ""
+        }
+        let current = committedText
+        guard current != sentText else { return marked == nil }
+        let prefixCount = zip(sentText, current).prefix(while: { $0 == $1 }).count
+        let deleteCount = sentText.count - prefixCount
+        let insertion = String(current.dropFirst(prefixCount))
+        guard applyEdit?(deleteCount, insertion) == true else {
+            // Do not keep invisible rejected input to replay on a later key.
+            resetContext()
+            return false
+        }
+        sentText = current
+        return marked == nil
+    }
+
+    func finishInputContext() {
+        guard acceptingInput else { return }
+        _ = synchronizeText()
+        resetContext()
+    }
+
+    func prepareShortcut() -> Bool {
+        guard markedTextRange == nil, synchronizeText() else { return false }
+        // Future IME corrections must not delete text at a caret moved by a shortcut.
+        resetContext()
+        return true
+    }
+
+    func stop() {
+        guard acceptingInput else { return }
+        _ = synchronizeText()
+        acceptingInput = false
+        applyEdit = nil
+        key = nil
+        resetContext()
+    }
+
+    private func resetContext() {
+        generation &+= 1
+        changeScheduled = false
+        resetting = true
+        super.unmarkText()
+        text = ""
+        sentText = ""
+        committedText = ""
+        resetting = false
+    }
+}

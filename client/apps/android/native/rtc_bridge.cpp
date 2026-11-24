@@ -1,0 +1,568 @@
+#include <jni.h>
+#include <android/native_window_jni.h>
+#include <libyuv.h>
+#include <minirtc.h>
+#include <remote_action.h>
+#include <app_version.h>
+#include <stream_names.h>
+#include <display_stream_id.h>
+#include <nlohmann/json.hpp>
+#include <atomic>
+#include <algorithm>
+#include <cstring>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <stdexcept>
+#include <vector>
+#include "controller_protocol.h"
+#include "mobile_direct_connection.h"
+#include "../../../libs/controller/include/mobile_device_trust.h"
+#include "file_transfer_session.h"
+#include "latest_frame_worker.h"
+#include "video_picture.h"
+#include "video_timing.h"
+
+namespace {
+using namespace crossdesk;
+using nlohmann::json;
+JavaVM* vm = nullptr;
+struct Environment {
+  JNIEnv* env = nullptr;
+  bool attached = false;
+  Environment() {
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
+      attached = vm->AttachCurrentThread(&env, nullptr) == JNI_OK;
+    }
+  }
+  ~Environment() { if (attached) vm->DetachCurrentThread(); }
+};
+std::string String(JNIEnv* env, jstring value) {
+  if (!value) return {};
+  const char* bytes = env->GetStringUTFChars(value, nullptr);
+  std::string result = bytes ? bytes : "";
+  if (bytes) env->ReleaseStringUTFChars(value, bytes);
+  return result;
+}
+struct Session;
+using android_controller::VideoPicture;
+void RenderVideo(Session* s, VideoPicture picture);
+struct CallbackContext { Session* owner; bool controller; };
+struct Session {
+  jobject owner = nullptr;
+  jmethodID event_method, audio_method, frame_method;
+  mobile_controller::DirectConnection direct;
+  MiniRtcPeerPtr* identity = nullptr;
+  MiniRtcPeerPtr* controller = nullptr;
+  CallbackContext identity_context{this, false}, controller_context{this, true};
+  std::string host, log_path, identity_login, controller_login, remote;
+  std::unique_ptr<mobile_controller::DeviceTrustIdentity> trust;
+  int port;
+  std::atomic<bool> stopping{false};
+  std::atomic<uint64_t> signal_generation{0};
+  std::atomic<int> signal_status{-1};
+  std::atomic<int> display{0};
+  std::atomic<bool> surface_ready{false};
+  std::atomic<uint64_t> video_generation{0};
+  std::mutex render_mutex;
+  ANativeWindow* window = nullptr;
+  uint32_t width = 0, height = 0;
+  uint64_t frame_id = 0;
+  std::optional<VideoPicture> surface_picture;
+  void DetachDecoderSurface() {
+    if (surface_picture) surface_picture->RenderSurface(nullptr);
+    surface_picture.reset();
+  }
+  std::set<int> pressed_keys;
+  unsigned pressed_buttons = 0;
+  float pointer_x = .5f, pointer_y = .5f;
+  android_controller::LatestFrameWorker<VideoPicture> renderer{
+      [this](VideoPicture picture) { RenderVideo(this, std::move(picture)); }};
+  android_controller::FileTransferSession files{
+      [this](const char* stream, const char* data, size_t size) {
+        return controller && !stopping
+            ? MiniRtcSendReliableDataFrame(controller, data, size, stream) : -1;
+      },
+      [this](const std::string& name, double progress, bool sending, const std::string& path) {
+        Event(10, {{"name", name}, {"progress", progress}, {"sending", sending}, {"path", path}});
+      }};
+
+  void Event(int type, const char* data, size_t size) {
+    if (stopping || size > 1024 * 1024) return;
+    Environment scope;
+    if (!scope.env) return;
+    jbyteArray bytes = scope.env->NewByteArray(static_cast<jsize>(size));
+    if (!bytes) return;
+    scope.env->SetByteArrayRegion(bytes, 0, size, reinterpret_cast<const jbyte*>(data));
+    scope.env->CallVoidMethod(owner, event_method, type, bytes);
+    scope.env->DeleteLocalRef(bytes);
+    if (scope.env->ExceptionCheck()) scope.env->ExceptionClear();
+  }
+  void Event(int type, const json& value) {
+    const std::string data = value.dump(-1, ' ', false, json::error_handler_t::replace); Event(type, data.data(), data.size());
+  }
+  void Send(const char* stream, const std::string& data) {
+    if (controller && !stopping && !data.empty())
+      MiniRtcSendReliableDataFrame(controller, data.data(), data.size(), stream);
+  }
+  void Surface(JNIEnv* env, jobject surface) {
+    std::lock_guard<std::mutex> lock(render_mutex);
+    ++video_generation;
+    renderer.Clear();
+    DetachDecoderSurface();
+    if (window) ANativeWindow_release(window);
+    window = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+    surface_ready = window != nullptr;
+    width = height = 0;
+  }
+  ~Session() {
+    // API calls and destruction share the Java RTC executor. Release any
+    // delivered input even when queued Java key-up events were cancelled.
+    if (controller) {
+      for (int key : pressed_keys) {
+        RemoteAction action{}; action.type = keyboard;
+        action.k = {static_cast<size_t>(key), 0, false, key_up};
+        Send(kKeyboardStream, action.to_json());
+      }
+      for (int button = 0; button < 3; ++button) {
+        if (!(pressed_buttons & (1u << button))) continue;
+        RemoteAction action{}; action.type = mouse;
+        action.m = {pointer_x, pointer_y, 0, static_cast<MouseFlag>(2 + button * 2)};
+        Send(kMouseStream, action.to_json());
+      }
+    }
+    stopping = true;
+    renderer.Stop();
+    if (controller) {
+      if (remote.find(':') != std::string::npos) direct.Stop();
+      else MiniRtcLeaveConnection(controller, remote.c_str());
+      MiniRtcDestroyPeer(&controller);
+    }
+    if (identity) MiniRtcDestroyPeer(&identity);
+    Environment scope;
+    Surface(scope.env, nullptr);
+    if (scope.env) scope.env->DeleteGlobalRef(owner);
+  }
+};
+
+void Signal(MiniRtcSignalStatus status, const char*, size_t, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  if (!ctx->controller && status == MiniRtcSignalStatus::MiniRtcSignalConnected &&
+      !ctx->owner->stopping && ctx->owner->identity) {
+    // Report after every identity login, including reconnects. The server
+    // ignores client_info sent through the temporary C- controller peer.
+    constexpr char info[] =
+        R"({"type":"client_info","version":"android-native","platform":"android"})";
+    MiniRtcSendSignalMessage(ctx->owner->identity, info, sizeof(info) - 1);
+  }
+  if (!ctx->controller && ctx->owner->signal_status.exchange(status) != status)
+    ++ctx->owner->signal_generation;
+  const auto generation = ctx->owner->signal_generation.load();
+  ctx->owner->Event(1, {{"controller", ctx->controller}, {"status", status}, {"generation", generation}});
+}
+void SignalMessage(const char* data, size_t size, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->controller || !data || !size || size > 1024 * 1024) return;
+  const auto generation = ctx->owner->signal_generation.load();
+  auto message = json::parse(data, data + size, nullptr, false);
+  if (!message.is_object() || !message.contains("type") || !message["type"].is_string()) return;
+  const auto type = message["type"].get<std::string>();
+  if (type == "announcements" || type == "announcements_changed") ctx->owner->Event(8, data, size);
+  else if (type == "presence" || type == "presence_update") {
+    message["generation"] = generation;
+    ctx->owner->Event(9, message);
+  }
+}
+void Connection(MiniRtcConnectionStatus status, const char*, size_t, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  if (ctx->controller && !ctx->owner->direct.Status(status)) ctx->owner->Event(2, {{"status", status}});
+}
+void Network(const char* id, size_t size, MiniRtcTraversalMode mode,
+             const MiniRtcNetTrafficStats* stats, const char*, size_t, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  if (!ctx->controller && mode == MiniRtcTraversalUnknown && id && size) {
+    ctx->owner->Event(3, id, size);
+  } else if (ctx->controller && stats) {
+    ctx->owner->Event(7, android_controller::NetworkReport(*stats, mode));
+  }
+}
+void Data(const char* data, size_t size, const char*, size_t,
+          const char* stream, size_t stream_size, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  if (!ctx->controller || !data || !stream || size > kMaxClipboardBytes) return;
+  const std::string name(stream, stream_size);
+  if (name == kFileStream) { ctx->owner->files.Receive(data, size); return; }
+  if (name == kFileFeedbackStream) { ctx->owner->files.Ack(data, size); return; }
+  if (name == kControlStream) {
+    if (auto proof = ctx->owner->trust->ChallengeResponse(std::string_view(data, size),
+            ctx->owner->controller_login.substr(2), "CrossDesk Android")) {
+      ctx->owner->Send(kControlStream, *proof);
+      return;
+    }
+    RemoteAction action{};
+    if (action.from_json(std::string(data, size))) {
+      const auto message = action.to_json();
+      ctx->owner->Event(4, message.data(), message.size());
+      FreeRemoteAction(action);
+    }
+  }
+  if (name == kClipboardStream) ctx->owner->Event(6, data, size);
+}
+void Audio(const char* data, size_t size, const char*, size_t,
+           const char*, size_t, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  auto* s = ctx->owner;
+  if (!ctx->controller || s->stopping || !data || !size || size > 23040) return;
+  Environment scope;
+  if (!scope.env) return;
+  auto bytes = scope.env->NewByteArray(size);
+  if (!bytes) return;
+  scope.env->SetByteArrayRegion(bytes, 0, size, reinterpret_cast<const jbyte*>(data));
+  scope.env->CallVoidMethod(s->owner, s->audio_method, bytes);
+  scope.env->DeleteLocalRef(bytes);
+  if (scope.env->ExceptionCheck()) scope.env->ExceptionClear();
+}
+void Video(const MiniRtcVideoFrame* frame, const char*, size_t,
+           const char* stream, size_t stream_size, void* user) {
+  auto* ctx = static_cast<CallbackContext*>(user);
+  auto* s = ctx->owner;
+  const auto generation = s->video_generation.load();
+  if (!ctx->controller || s->stopping || !s->surface_ready || !frame || !stream ||
+      std::string(stream, stream_size) != MakeDisplayStreamId(s->display.load())) return;
+  auto picture = VideoPicture::RetainOrCopy(*frame, generation);
+  if (picture) s->renderer.Submit(std::move(*picture));
+}
+void RenderVideo(Session* s, VideoPicture picture) {
+  const auto w = picture.width, h = picture.height;
+  std::lock_guard<std::mutex> lock(s->render_mutex);
+  if (s->stopping || !s->window || picture.generation != s->video_generation) return;
+  const bool size_changed = s->width != w || s->height != h;
+  if (picture.IsSurface()) {
+    if (picture.RenderSurface(s->window) != 0) return;
+    // Keep a consumed token to detach the codec before Surface destruction,
+    // monitor switching, or CPU rendering after a software fallback.
+    s->surface_picture = picture;
+  } else {
+    const bool was_surface = s->surface_picture.has_value();
+    s->DetachDecoderSurface();
+    if ((size_changed || was_surface) &&
+        ANativeWindow_setBuffersGeometry(s->window, w, h, WINDOW_FORMAT_RGBA_8888) != 0) return;
+    ANativeWindow_Buffer buffer{};
+    if (ANativeWindow_lock(s->window, &buffer, nullptr) != 0) return;
+    const bool rendered = buffer.width == static_cast<int>(w) && buffer.height == static_cast<int>(h) &&
+      libyuv::NV12ToABGR(picture.Y(), picture.YStride(), picture.UV(), picture.UVStride(),
+                       static_cast<uint8_t*>(buffer.bits), buffer.stride * 4, w, h) == 0;
+    if (ANativeWindow_unlockAndPost(s->window) != 0 || !rendered) return;
+  }
+  if (size_changed) {
+    s->width = w; s->height = h;
+    s->Event(5, {{"width", w}, {"height", h}});
+  }
+  // Measure through display submission, using MiniRTC's calibrated capture clock.
+  const auto now = MiniRtcGetSystemTimeMicros(s->controller);
+  const double latency = android_controller::VideoLatencyMilliseconds(
+      picture.captured_us, picture.received_us, now);
+  Environment scope;
+  if (scope.env) {
+    scope.env->CallVoidMethod(s->owner, s->frame_method, static_cast<jlong>(++s->frame_id), latency, static_cast<jint>(w), static_cast<jint>(h));
+    if (scope.env->ExceptionCheck()) scope.env->ExceptionClear();
+  }
+}
+MiniRtcParams Parameters(Session* s, bool controller) {
+  MiniRtcParams p{};
+  std::snprintf(p.signal_server_ip, sizeof(p.signal_server_ip), "%s", s->host.c_str());
+  std::snprintf(p.log_path, sizeof(p.log_path), "%s", s->log_path.c_str());
+  p.signal_server_port = s->port;
+  p.hardware_acceleration = true;
+  // MediaCodec returns retained Surface buffers; software fallback returns
+  // pooled CPU NV12 with the same ownership contract.
+  p.native_video_output = controller;
+  p.turn_mode = MiniRtcTurnAutoUdpTcp;
+  p.enable_srtp = true;
+  p.video_content_type = MiniRtcVideoContentType::ScreenContent;
+  p.video_quality = MiniRtcVideoQualityMedium;
+  p.video_frame_rate = 30;
+  p.video_degradation_preference = MiniRtcVideoDegradationPreference::Balanced;
+  p.on_signal_status = Signal; p.on_connection_status = Connection;
+  p.on_signal_message = SignalMessage;
+  p.on_net_status_report = Network; p.on_receive_data_buffer = Data;
+  p.on_receive_video_frame = Video; p.on_receive_audio_buffer = Audio;
+  p.user_id = (controller ? s->controller_login : s->identity_login).c_str();
+  p.user_data = controller ? &s->controller_context : &s->identity_context;
+  return p;
+}
+Session* From(jlong handle) { return reinterpret_cast<Session*>(handle); }
+} // namespace
+
+extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
+  vm = java_vm;
+  if (MiniRtcSetAndroidJavaVm(java_vm) != 0) return JNI_ERR;
+  return JNI_VERSION_1_6;
+}
+#define JNI_METHOD(name) Java_cn_crossdesk_mobile_NativeSession_##name
+extern "C" JNIEXPORT jstring JNICALL JNI_METHOD(nGenerateTrustKey)(JNIEnv* env, jclass) {
+  try {
+    auto seed = mobile_controller::DeviceTrustIdentity::GeneratePrivateKey();
+    auto result = env->NewStringUTF(seed.c_str());
+    mobile_controller::DeviceTrustIdentity::ClearSecret(seed);
+    return result;
+  } catch (const std::exception&) { return nullptr; }
+}
+extern "C" JNIEXPORT jstring JNICALL JNI_METHOD(nTrustInfo)(
+    JNIEnv* env, jclass, jstring key, jstring device_id) {
+  try {
+    auto seed = String(env, key);
+    // Clean the temporary JNI copy even when key validation fails.
+    struct Clean { std::string& value; ~Clean() { mobile_controller::DeviceTrustIdentity::ClearSecret(value); } } clean{seed};
+    mobile_controller::DeviceTrustIdentity trust(seed);
+    const auto info = json{{"pairing", trust.PairingInfo(String(env, device_id), "CrossDesk Android")},
+                           {"fingerprint", trust.Fingerprint()}}.dump();
+    return env->NewStringUTF(info.c_str());
+  } catch (const std::exception&) { return nullptr; }
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nValidAppVersion)(
+    JNIEnv* env, jclass, jstring version) {
+  return version && env->GetStringUTFLength(version) < 64 &&
+         crossdesk::IsValidAppVersion(String(env, version));
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nHasAppUpdate)(
+    JNIEnv* env, jclass, jstring version, jbyteArray release_json) {
+  if (!release_json) return false;
+  const auto size = env->GetArrayLength(release_json);
+  if (size <= 0 || size > 256 * 1024) return false;
+  std::string data(size, '\0');
+  env->GetByteArrayRegion(release_json, 0, size, reinterpret_cast<jbyte*>(data.data()));
+  if (env->ExceptionCheck()) return false;
+  const auto latest = crossdesk::ParseVersionInfoJSON(data);
+  return latest && crossdesk::AvailableAppUpdate(String(env, version), *latest).has_value();
+}
+extern "C" JNIEXPORT jstring JNICALL JNI_METHOD(nCheckMobileUpdate)(
+    JNIEnv* env, jclass, jstring version, jbyteArray release_json) {
+  if (!version || !release_json) return nullptr;
+  const auto size = env->GetArrayLength(release_json);
+  if (size <= 0 || size > 256 * 1024) return nullptr;
+  std::string data(size, '\0');
+  env->GetByteArrayRegion(release_json, 0, size, reinterpret_cast<jbyte*>(data.data()));
+  if (env->ExceptionCheck()) return nullptr;
+  const auto result = crossdesk::CheckPlatformAppUpdate(
+      String(env, version), data, "android-arm64");
+  return result ? env->NewStringUTF(result->c_str()) : nullptr;
+}
+extern "C" JNIEXPORT jlong JNICALL JNI_METHOD(nCreate)(
+    JNIEnv* env, jclass, jobject owner, jstring host, jint port, jstring identity,
+    jstring log_path, jstring certificates, jstring trust_key, jboolean controller_only) {
+  try {
+    auto s = std::make_unique<Session>();
+    s->owner = env->NewGlobalRef(owner);
+    auto cls = env->GetObjectClass(owner);
+    s->event_method = env->GetMethodID(cls, "onNativeEvent", "(I[B)V");
+    s->audio_method = env->GetMethodID(cls, "onNativeAudio", "([B)V");
+    s->frame_method = env->GetMethodID(cls, "onNativeVideoFrame", "(JDII)V");
+    env->DeleteLocalRef(cls);
+    s->host = String(env, host); s->port = port;
+    s->identity_login = String(env, identity); s->log_path = String(env, log_path);
+    auto seed = String(env, trust_key);
+    struct Clean { std::string& value; ~Clean() { mobile_controller::DeviceTrustIdentity::ClearSecret(value); } } clean{seed};
+    s->trust = std::make_unique<mobile_controller::DeviceTrustIdentity>(seed);
+    // The bundle is exported from Android's default TrustManager, never the
+    // build machine's certificate store. MiniRTC on Android explicitly
+    // loads this path: OpenSSL's default loader ignores SSL_CERT_FILE in an
+    // Android app process (AT_SECURE=1). Chain and hostname checks stay enabled.
+    const auto bundle = String(env, certificates);
+    // An ID-based controller starts after the identity peer has configured TLS.
+    if (!controller_only && (bundle.empty() || setenv("SSL_CERT_FILE", bundle.c_str(), 1) != 0))
+      throw std::runtime_error("Unable to configure Android trust bundle");
+    // MiniRTC's diagnostic log includes login identities. Keep credentials
+    // solely in Keystore-backed storage; do not persist its session logging.
+    if (MiniRtcConfigureLogging(MiniRtcLogOff, nullptr, nullptr) != 0)
+      throw std::runtime_error("Unable to configure MiniRTC logging");
+    if (controller_only) return reinterpret_cast<jlong>(s.release());
+    auto params = Parameters(s.get(), false);
+    s->identity = MiniRtcCreatePeer(&params);
+    if (!s->identity || MiniRtcInit(s->identity) != 0) return 0;
+    return reinterpret_cast<jlong>(s.release());
+  } catch (const std::exception&) { return 0; }
+}
+extern "C" JNIEXPORT jstring JNICALL JNI_METHOD(directEndpoint)(JNIEnv* env, jclass, jstring input) {
+  auto endpoint = mobile_controller::DirectConnection::Endpoint(String(env, input));
+  return env->NewStringUTF(endpoint.c_str());
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nConnect)(
+    JNIEnv* env, jclass, jlong handle, jstring identity, jstring remote, jstring password) {
+  auto* s = From(handle);
+  if (!s || s->controller) return false;
+  s->controller_login = "C-" + String(env, identity);
+  s->remote = String(env, remote);
+  auto params = Parameters(s, true);
+  s->controller = MiniRtcCreatePeer(&params);
+  if (!s->controller) return false;
+  MiniRtcAddAudioStream(s->controller, kAudioStream);
+  MiniRtcAddDataStream(s->controller, kDataStream, false);
+  for (const char* name : {kMouseStream, kKeyboardStream, kControlStream,
+                          kClipboardStream, kFileStream, kFileFeedbackStream}) MiniRtcAddDataStream(s->controller, name, true);
+  if (s->remote.find(':') != std::string::npos) {
+    return s->direct.Start(s->controller, s->remote, String(env, password),
+        [s](MiniRtcConnectionStatus status) { s->Event(2, {{"status", status}}); });
+  }
+  if (MiniRtcInit(s->controller) != 0) return false;
+  const auto join = s->remote + "@" + String(env, password);
+  return MiniRtcJoinConnection(s->controller, join.c_str()) == 0;
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nReady)(JNIEnv* env, jclass, jlong handle, jbyteArray preferences) {
+  auto* s = From(handle); if (!s || !s->controller) return;
+  auto action = MakeHostInformation("CrossDesk Android", {}, true, "1.6.0", HostPlatform::Android);
+  action.i.supports_video_codec_status = true;
+  if (preferences && env->GetArrayLength(preferences) <= 65536) {
+    std::string bytes(env->GetArrayLength(preferences), '\0');
+    env->GetByteArrayRegion(preferences, 0, bytes.size(), reinterpret_cast<jbyte*>(bytes.data()));
+    if (!env->ExceptionCheck())
+      ParseDisplayResolutionPreferences(bytes, action.preferred_display_resolutions);
+  }
+  s->Send(kControlStream, mobile_controller::DeviceTrustIdentity::Advertise(action.to_json()));
+  FreeRemoteAction(action);
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nPointer)(
+    JNIEnv*, jclass, jlong handle, jfloat x, jfloat y, jint flag, jint wheel) {
+  auto* s = From(handle); if (!s || flag < 0 || flag > 8) return;
+  RemoteAction action{}; action.type = mouse;
+  action.m = {std::clamp(x, 0.f, 1.f), std::clamp(y, 0.f, 1.f), wheel, static_cast<MouseFlag>(flag)};
+  s->pointer_x = action.m.x; s->pointer_y = action.m.y;
+  if (flag >= 1 && flag <= 6) {
+    const unsigned bit = 1u << ((flag - 1) / 2);
+    if (flag & 1) s->pressed_buttons |= bit; else s->pressed_buttons &= ~bit;
+  }
+  s->Send(kMouseStream, action.to_json());
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nKey)(JNIEnv*, jclass, jlong handle, jint key, jboolean down) {
+  auto* s = From(handle); if (!s) return;
+  RemoteAction action{}; action.type = keyboard;
+  action.k = {static_cast<size_t>(key), 0, false, down ? key_down : key_up};
+  if (down) s->pressed_keys.insert(key); else s->pressed_keys.erase(key);
+  s->Send(kKeyboardStream, action.to_json());
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nText)(JNIEnv* env, jclass, jlong handle, jbyteArray bytes) {
+  auto* s = From(handle); if (!s || !bytes) return;
+  const auto size = env->GetArrayLength(bytes);
+  if (size <= 0 || static_cast<size_t>(size) > kMaxTextInputBytes) return;
+  RemoteAction action{}; action.type = text_input;
+  action.text.resize(size);
+  env->GetByteArrayRegion(bytes, 0, size, reinterpret_cast<jbyte*>(action.text.data()));
+  if (env->ExceptionCheck() || action.text.find('\0') != std::string::npos) return;
+  // Java supplies standard UTF-8, including supplementary Unicode characters.
+  s->Send(kKeyboardStream, action.to_json());
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nControl)(
+    JNIEnv*, jclass, jlong handle, jint type, jint value) {
+  auto* s = From(handle); if (!s) return;
+  RemoteAction action{};
+  if (type == display_id && value >= 0 && value < 8) {
+    { std::lock_guard<std::mutex> lock(s->render_mutex); s->display = value; ++s->video_generation; s->renderer.Clear(); s->DetachDecoderSurface(); s->width = s->height = 0; }
+    action.type = display_id; action.d = value;
+  } else if (type == audio_capture) {
+    action.type = audio_capture; action.a = value != 0;
+  } else return;
+  s->Send(kControlStream, action.to_json());
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nVideoSettings)(
+    JNIEnv*, jclass, jlong handle, jint quality, jint rate, jint preference, jlong request_id) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping || request_id < 0 || request_id > UINT32_MAX) return false;
+  const auto data = android_controller::VideoSettingsMessage(quality, rate, preference, static_cast<uint32_t>(request_id));
+  if (data.empty()) return false;
+  return MiniRtcSendReliableDataFrame(s->controller, data.data(), data.size(), kControlStream) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nDisplayResolution)(
+    JNIEnv* env, jclass, jlong handle, jint display_id, jstring display_key,
+    jint width, jint height, jlong request_id) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping || request_id <= 0 || request_id > UINT32_MAX) return false;
+  const auto data = mobile_controller::DisplayResolutionMessage(
+      display_id, String(env, display_key), width, height, static_cast<uint32_t>(request_id));
+  return !data.empty() && MiniRtcSendReliableDataFrame(
+      s->controller, data.data(), data.size(), kControlStream) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nSecureAttention)(JNIEnv*, jclass, jlong handle) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping) return false;
+  const auto data = android_controller::SecureAttentionMessage();
+  return MiniRtcSendReliableDataFrame(s->controller, data.data(), data.size(), kControlStream) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nPrivacy)(
+    JNIEnv*, jclass, jlong handle, jint flag, jboolean block_input) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping) return false;
+  const auto data = android_controller::PrivacyMessage(flag, block_input);
+  return !data.empty() &&
+      MiniRtcSendReliableDataFrame(s->controller, data.data(), data.size(), kControlStream) == 0;
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nFileDirectory)(JNIEnv* env, jclass, jlong handle, jstring directory) {
+  auto* s = From(handle); if (s) s->files.SetDirectory(String(env, directory));
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nSendFile)(JNIEnv* env, jclass, jlong handle, jstring path, jbyteArray name) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping || !name) return false;
+  const auto size = env->GetArrayLength(name);
+  if (!size || size > UINT16_MAX) return false;
+  std::string label(size, '\0');
+  env->GetByteArrayRegion(name, 0, size, reinterpret_cast<jbyte*>(label.data()));
+  return !env->ExceptionCheck() && s->files.Start(String(env, path), label);
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nPumpFiles)(JNIEnv*, jclass, jlong handle) {
+  auto* s = From(handle);
+  if (!s || s->stopping) return false;
+  s->files.Pump();
+  return s->files.Sending();
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nAnnouncementRequest)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray data) {
+  auto* s = From(handle);
+  if (!s || !s->identity || s->stopping || !data) return false;
+  const auto size = env->GetArrayLength(data);
+  if (size <= 0 || size > 4096) return false;
+  std::string bytes(size, '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
+  if (env->ExceptionCheck()) return false;
+  auto message = json::parse(bytes, nullptr, false);
+  if (!message.is_object() || !message.contains("type") ||
+      !message["type"].is_string() || message["type"] != "announcements_list") return false;
+  return MiniRtcSendSignalMessage(s->identity, bytes.data(), bytes.size()) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nPresenceRequest)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray data) {
+  auto* s = From(handle);
+  if (!s || !s->identity || s->stopping || !data) return false;
+  const auto size = env->GetArrayLength(data);
+  if (size <= 0 || size > 4096) return false;
+  std::string bytes(size, '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
+  if (env->ExceptionCheck()) return false;
+  auto message = json::parse(bytes, nullptr, false);
+  if (!message.is_object() || !message.contains("type") || !message["type"].is_string() ||
+      message["type"] != "recent_connections_presence" ||
+      !message.contains("user_id") || !message["user_id"].is_string() ||
+      !message.contains("devices") || !message["devices"].is_array() ||
+      !message.contains("subscribe") || message["subscribe"] != true) return false;
+  return MiniRtcSendSignalMessage(s->identity, bytes.data(), bytes.size()) == 0;
+}
+extern "C" JNIEXPORT jboolean JNICALL JNI_METHOD(nClipboard)(
+    JNIEnv* env, jclass, jlong handle, jbyteArray data) {
+  auto* s = From(handle);
+  if (!s || !s->controller || s->stopping || !data) return false;
+  const auto size = env->GetArrayLength(data);
+  if (!size || size > static_cast<int>(kMaxClipboardBytes)) return false;
+  std::string bytes(size, '\0');
+  env->GetByteArrayRegion(data, 0, size, reinterpret_cast<jbyte*>(bytes.data()));
+  if (env->ExceptionCheck() || bytes.find('\0') != std::string::npos) return false;
+  const auto id = s->remote.find(':') == std::string::npos ? s->remote : s->direct.RemotePeerId();
+  return !id.empty() && MiniRtcSendReliableDataFrameToPeer(
+      s->controller, bytes.data(), bytes.size(), kClipboardStream, id.data(), id.size()) == 0;
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nSurface)(JNIEnv* env, jclass, jlong handle, jobject surface) {
+  if (auto* s = From(handle)) {
+    s->Surface(env, surface);
+    if (surface && s->controller && !s->stopping)
+      MiniRtcRequestVideoKeyFrame(s->controller, MakeDisplayStreamId(s->display.load()).c_str());
+  }
+}
+extern "C" JNIEXPORT void JNICALL JNI_METHOD(nDestroy)(JNIEnv*, jclass, jlong handle) { delete From(handle); }

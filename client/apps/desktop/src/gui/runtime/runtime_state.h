@@ -1,0 +1,241 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2026-09-04
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _RUNTIME_STATE_H_
+#define _RUNTIME_STATE_H_
+
+#include <stream_names.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "common/task_queue_lock_free.h"
+#include "config_center.h"
+#include "path_manager.h"
+#include "runtime/device_presence_cache.h"
+#include "runtime/preview_subscriptions.h"
+#include "runtime/remote_session.h"
+#include "runtime/session_lifecycle.h"
+#include "thumbnail.h"
+
+#if _WIN32
+#include "platform/windows/service/service_query_worker.h"
+#include "platform/windows/service/shared_identity.h"
+#endif
+
+namespace crossdesk::gui_detail {
+
+struct InfrastructureState {
+  PreviewSubscriptions preview_subscriptions_;
+  std::mutex audio_delivery_mutex_;
+  std::unique_ptr<ConfigCenter> config_center_;
+  ConfigCenter::LANGUAGE localization_language_ =
+      ConfigCenter::LANGUAGE::CHINESE;
+  std::unique_ptr<PathManager> path_manager_;
+  std::string exec_log_path_;
+  std::string dll_log_path_;
+  std::string cache_path_;
+#ifdef _WIN32
+  std::unique_ptr<SharedHostIdentity> shared_identity_;
+#endif
+  int localization_language_index_ = -1;
+  bool modules_inited_ = false;
+  unsigned char aes128_key_[16]{};
+  unsigned char aes128_iv_[16]{};
+};
+
+struct RecentConnectionsState {
+  std::shared_ptr<Thumbnail> thumbnail_;
+  std::vector<std::pair<std::string, Thumbnail::RecentConnection>>
+      recent_connections_;
+  std::vector<std::string> recent_connection_ids_;
+  std::vector<std::string> gallery_presence_ids_;
+  uint32_t recent_connection_image_save_time_ = 0;
+  DevicePresenceCache device_presence_cache_;
+  std::atomic<bool> need_to_send_recent_connections_{true};
+  std::chrono::steady_clock::time_point next_presence_refresh_at_{};
+  std::chrono::steady_clock::time_point last_presence_request_attempt_at_{};
+};
+
+struct PeerState {
+  MiniRtcSignalStatus signal_status_ = MiniRtcSignalStatus::MiniRtcSignalClosed;
+  std::string signal_status_str_;
+  std::atomic<bool> signal_connected_{false};
+  MiniRtcPeerPtr *peer_ = nullptr;
+  MiniRtcPeerPtr *peer_reserved_ = nullptr;
+  std::string video_primary_label_ = "primary_display";
+  std::string video_secondary_label_ = "secondary_display";
+  std::string audio_label_ = "audio";
+  std::string data_label_ = kDataStream;
+  std::string mouse_label_ = kMouseStream;
+  std::string keyboard_label_ = kKeyboardStream;
+  std::string info_label_ = "info";
+  std::string control_data_label_ = kControlStream;
+  std::string file_label_ = kFileStream;
+  std::string file_feedback_label_ = kFileFeedbackStream;
+  std::string clipboard_label_ = kClipboardStream;
+  MiniRtcParams params_{};
+};
+
+// OS-specific service and permission state is kept separate from transport
+// state so platform code does not appear to be part of the wire contract.
+struct PlatformIntegrationState {
+#if _WIN32
+  std::unique_ptr<ServiceQueryWorker> windows_service_worker_;
+  // Lifecycle gate for interactive hosts; revoked before shutdown.
+  std::shared_ptr<std::atomic<bool>> windows_rdp_handoff_allowed_ =
+      std::make_shared<std::atomic<bool>>(false);
+  // Transport callbacks revoke this immediately; a stale UI snapshot cannot
+  // authorize a request after the last authenticated controller disconnects.
+  std::shared_ptr<std::atomic<bool>> windows_rdp_handoff_connected_ =
+      std::make_shared<std::atomic<bool>>(false);
+  // Published by the UI, read by transport callbacks without sharing a mutable string.
+  mutable std::mutex windows_input_stage_mutex_;
+  std::string windows_input_stage_;
+  std::atomic<bool> windows_consent_ui_{false};
+  std::atomic<bool> pending_windows_service_sas_{false};
+  bool local_service_status_received_ = false;
+  std::atomic<bool> local_service_available_{false};
+  std::string local_interactive_stage_;
+  uint32_t last_local_secure_input_block_log_tick_ = 0;
+  uint32_t last_windows_service_status_tick_ = 0;
+  uint32_t optimistic_windows_secure_desktop_until_tick_ = 0;
+#if CROSSDESK_PORTABLE
+  enum class PortableServiceInstallState {
+    idle,
+    installing,
+    succeeded,
+    failed,
+  };
+  bool portable_service_prompt_checked_ = false;
+  bool show_portable_service_install_window_ = false;
+  bool show_portable_service_prompt_suppressed_window_ = false;
+  bool portable_service_do_not_remind_ = false;
+  bool portable_service_prompt_suppressed_ = false;
+  bool portable_service_installed_ = false;
+  bool portable_service_needs_repair_ = false;
+  std::atomic<PortableServiceInstallState> portable_service_install_state_{
+      PortableServiceInstallState::idle};
+  std::thread portable_service_install_thread_;
+#endif
+#endif
+
+#ifdef __APPLE__
+  bool show_request_permission_window_ = true;
+  bool mac_permission_status_initialized_ = false;
+  uint32_t mac_permission_last_check_tick_ = 0;
+  bool mac_screen_recording_permission_granted_ = false;
+  bool mac_accessibility_permission_granted_ = false;
+  bool mac_screen_recording_permission_requested_ = false;
+  bool mac_accessibility_permission_requested_ = false;
+#endif
+};
+
+struct UserSettingsState {
+  char client_id_[10] = "";
+  char client_id_with_password_[17] = "";
+  char password_saved_[7] = "";
+  char self_hosted_id_[17] = "";
+  char self_hosted_user_id_[17] = "";
+  char connection_login_identity_[17] = "";
+  int language_button_value_ = 0;
+  int video_encode_format_button_value_ = 0;
+  char signal_server_ip_[256] = "api.crossdesk.cn";
+  char signal_server_port_[6] = "9099";
+  bool enable_self_hosted_ = false;
+  int language_button_value_last_ = 0;
+  int video_encode_format_button_value_last_ = 0;
+  bool enable_self_hosted_last_ = false;
+  bool enable_autostart_ = false;
+  bool enable_autostart_last_ = false;
+  bool enable_daemon_ = false;
+  bool enable_daemon_last_ = false;
+  char file_transfer_save_path_buf_[512] = "";
+  std::string file_transfer_save_path_last_;
+  char signal_server_ip_self_[256] = "";
+  char signal_server_port_self_[6] = "";
+  std::string selected_current_file_path_;
+  bool show_file_browser_ = true;
+};
+
+struct PasswordChangeState {
+  enum class CredentialRecoveryAction {
+    Idle, RetryActive, PromotePending, ClearPending, ResumePending
+  };
+  std::mutex password_change_mutex_;
+  uint64_t next_password_change_request_id_ = 0;
+  bool password_change_pending_ = false;
+  bool password_change_result_ready_ = false;
+  bool password_change_succeeded_ = false;
+  bool password_change_result_uncertain_ = false;
+  bool password_change_recovery_ = false;
+  std::chrono::steady_clock::time_point password_change_requested_at_;
+  std::string pending_password_change_request_id_;
+  std::string pending_local_password_;
+  std::string password_change_error_;
+  bool credential_recovery_in_progress_ = false;
+  bool credential_recovery_attempt_pending_ = false;
+  CredentialRecoveryAction credential_recovery_action_ = CredentialRecoveryAction::Idle;
+};
+
+struct ConnectionState {
+  using RemoteSessionMap =
+      std::unordered_map<std::string, RemoteSessionPtr>;
+  RemoteSessionMap remote_sessions_;
+  std::shared_mutex remote_sessions_mutex_;
+  TaskQueueLockFree session_cleanup_queue_;
+  std::unordered_map<std::string, std::future<void>> session_cleanup_tasks_;
+  std::future<void> connection_peer_cleanup_;
+  std::unordered_map<std::string, std::future<void>> controller_cleanup_tasks_;
+  struct PendingReconnect {
+    std::string password;
+    bool remember_password = false;
+    bool background = false;
+  };
+  std::unordered_map<std::string, PendingReconnect> pending_reconnects_;
+
+  std::shared_mutex connection_status_mutex_;
+  std::unordered_map<std::string, MiniRtcConnectionStatus> connection_status_;
+  std::unordered_map<std::string, std::string> connection_host_names_;
+  std::unordered_set<std::string> codec_status_controllers_;
+  // Cursor position is sampled asynchronously after remote mouse input has
+  // been injected. Remember the input source so the sampled position is not
+  // immediately echoed back to that same controller as stale feedback.
+  std::mutex remote_pointer_input_mutex_;
+  std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+      last_remote_pointer_input_time_;
+  std::string selected_server_remote_id_;
+  std::mutex pending_presence_probe_mutex_;
+  bool pending_presence_probe_ = false;
+  bool pending_presence_result_ready_ = false;
+  bool pending_presence_online_ = false;
+  std::chrono::steady_clock::time_point pending_presence_probe_started_at_;
+  std::string pending_presence_remote_id_;
+  std::string pending_presence_password_;
+  bool pending_presence_remember_password_ = false;
+};
+
+struct RuntimeState : InfrastructureState,
+                      RecentConnectionsState,
+                      PeerState,
+                      PlatformIntegrationState,
+                      UserSettingsState,
+                      PasswordChangeState,
+                      ConnectionState {};
+
+} // namespace crossdesk::gui_detail
+
+#endif

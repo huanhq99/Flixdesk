@@ -1,0 +1,409 @@
+package cn.crossdesk.mobile;
+
+import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Base64;
+import android.view.Surface;
+import org.json.JSONArray;
+import org.json.JSONObject;
+import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.security.KeyStore;
+import java.security.cert.X509Certificate;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+
+final class NativeSession implements AutoCloseable {
+    static final int MAX_CLIPBOARD_BYTES = 128 * 1024;
+    static { System.loadLibrary("crossdesk_android"); }
+    interface Listener {
+        void status(String message);
+        void connected();
+        void ended(String reason);
+        void data(JSONObject message);
+        void videoSize(int width, int height);
+        void clipboard(String text);
+        void statistics(RemoteNetworkStatistics.Snapshot value);
+        default void fileTransfer(String name,double progress,boolean sending,File received) { }
+        default void controlFeedback(String message) { }
+        default void privacyChanged() { }
+        default void displayResolutionFailed(long requestId) { }
+        default void signaling(int state, String deviceId) { }
+        default void signalingEnded(String reason) { ended(reason); }
+        default void presence(JSONObject message) { }
+        default void announcement(JSONObject message) { }
+        default void announcementFailed(String requestId) { }
+        default void passwordRejected() { ended(L10n.tr("远端密码错误")); }
+    }
+    // Serializes all peer creation/API calls/destruction, including across activities.
+    private static final ExecutorService RTC = Executors.newSingleThreadExecutor(r -> new Thread(r, "CrossDesk RTC"));
+    private final Handler main = new Handler(Looper.getMainLooper());
+    private final Context context;
+    private volatile Listener listener;
+    private final SecretStore secrets;
+    private final RemoteResolutionStore resolutionStore;
+    private final String host, scope;
+    private final boolean direct;
+    private final String remote;
+    private String password, identity = "";
+    private final int port;
+    private long handle;
+    private boolean signalReady, joining, started;
+    private volatile boolean connected, supportsTextInput;
+    final RemotePrivacyScreen privacyScreen = new RemotePrivacyScreen();
+    private int signalState;
+    private volatile long signalGeneration;
+    private boolean presenceRequested;
+    private volatile boolean closed;
+    private Surface surface;
+    private volatile AudioPlayer audio;
+    private final SessionDocuments documents;
+    private boolean sendingFile;
+    private final Runnable fileTick=new Runnable(){public void run(){
+        execute(()->{boolean sending=connected&&handle!=0&&nPumpFiles(handle);if(!closed)main.postDelayed(this,sending?10:1000);});
+    }};
+    private final RemoteNetworkStatistics networkStatistics=new RemoteNetworkStatistics();
+    private final Runnable statisticsTick=new Runnable(){public void run(){
+        if(closed)return;
+        privacyScreen.tick(android.os.SystemClock.elapsedRealtime());
+        listener.privacyChanged();
+        listener.statistics(networkStatistics.snapshot(RemoteNetworkStatistics.now()));
+        if(!closed)main.postDelayed(this,1000);
+    }};
+    private final Runnable timeout;
+
+    NativeSession(Context context, String host, int port, String remote, String password, Listener listener) {
+        this.context = context.getApplicationContext(); this.listener = listener;
+        this.host = host; this.port = port; this.remote = remote; this.password = password;
+        timeout = () -> fail(remote.isEmpty() ? L10n.tr("服务器连接超时，请检查服务器地址和网络")
+                : L10n.tr("连接超时，请检查设备 ID、服务器及远端在线状态"));
+        direct = remote.contains(":");
+        scope = host.toLowerCase(java.util.Locale.ROOT) + ":" + port;
+        secrets = new SecretStore(this.context);
+        resolutionStore = new RemoteResolutionStore(this.context);
+        documents = new SessionDocuments(this.context);
+    }
+    void start() {
+        if (started || closed) return;
+        started = true;
+        main.postDelayed(timeout, 40000);
+        execute(() -> {
+            try {
+                boolean controllerOnly = !remote.isEmpty();
+                identity = controllerOnly ? "" : secrets.get(scope);
+                String certificates = controllerOnly ? "" : exportTrust().getAbsolutePath();
+                File logs = new File(context.getNoBackupFilesDir(), "logs");
+                if (!logs.isDirectory() && !logs.mkdirs()) throw new IllegalStateException("Log directory unavailable");
+                handle = nCreate(this, host, port, identity, logs.getAbsolutePath(), certificates, trustKey(context), controllerOnly);
+                if (handle == 0) { fail(L10n.tr("原生连接初始化失败")); return; }
+                nFileDirectory(handle,new File(documents.directory,"received").getAbsolutePath());
+                if (direct) join("");
+                if (surface != null && surface.isValid()) nSurface(handle, surface);
+            } catch (Exception error) { fail(L10n.tr("安全存储或证书初始化失败，请重试或清除应用数据")); }
+        });
+    }
+    void connectAs(String deviceId) {
+        if (!direct && !remote.isEmpty() && !deviceId.isEmpty()) execute(() -> join(deviceId));
+    }
+    boolean isClosed() { return closed; }
+    // Called only on RTC, shared by every foreground/background session and UI export.
+    // This key belongs to the installation, not to a signaling server or login ID.
+    private static String trustKey(Context context) throws Exception {
+        SecretStore store = new SecretStore(context);
+        var preferences = context.getSharedPreferences("settings", Context.MODE_PRIVATE);
+        String seed = store.get("device-trust:v1");
+        if (seed.isEmpty()) {
+            if (preferences.getBoolean("deviceTrustInitialized", false))
+                throw new IllegalStateException("Device signing identity missing");
+            seed = nGenerateTrustKey();
+            if (seed == null) throw new IllegalStateException("Device signing identity unavailable");
+            store.put("device-trust:v1", seed);
+        }
+        if (!preferences.edit().putBoolean("deviceTrustInitialized", true).commit())
+            throw new IllegalStateException("Device signing identity marker unavailable");
+        return seed;
+    }
+    static void pairingInfo(Context context, String deviceId, java.util.function.Consumer<JSONObject> completed) {
+        Context app = context.getApplicationContext();
+        RTC.execute(() -> {
+            JSONObject info = null;
+            try { info = new JSONObject(nTrustInfo(trustKey(app), deviceId.split("@", 2)[0])); }
+            catch (Exception ignored) { }
+            JSONObject result = info;
+            new Handler(Looper.getMainLooper()).post(() -> completed.accept(result));
+        });
+    }
+    // UI callbacks run on the main thread. A service-owned state can replace
+    // the Activity listener without recreating either native peer.
+    void setListener(Listener value) { listener = java.util.Objects.requireNonNull(value); }
+    private void publishSignaling() {
+        int state = signalState;
+        // Only expose the public device ID, never the identity's @password suffix.
+        String deviceId = identity.split("@", 2)[0];
+        ui(() -> listener.signaling(state, deviceId));
+    }
+    private File exportTrust() throws Exception {
+        TrustManagerFactory factory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        factory.init((KeyStore) null);
+        StringBuilder pem = new StringBuilder();
+        for (TrustManager manager : factory.getTrustManagers()) {
+            if (manager instanceof X509TrustManager trust) {
+                for (X509Certificate certificate : trust.getAcceptedIssuers()) {
+                    pem.append("-----BEGIN CERTIFICATE-----\n")
+                            .append(Base64.encodeToString(certificate.getEncoded(), Base64.NO_WRAP))
+                            .append("\n-----END CERTIFICATE-----\n");
+                }
+            }
+        }
+        if (pem.length() == 0) throw new IllegalStateException("Empty Android trust store");
+        File output = new File(context.getNoBackupFilesDir(), "trusted-roots.pem");
+        Files.write(output.toPath(), pem.toString().getBytes(StandardCharsets.US_ASCII));
+        return output;
+    }
+    private void execute(Runnable task) { RTC.execute(() -> { if (!closed) task.run(); }); }
+    private void ui(Runnable task) { main.post(() -> { if (!closed) task.run(); }); }
+    private void fail(String reason) {
+        ui(() -> {
+            if (remote.isEmpty()) listener.signalingEnded(reason);
+            else listener.ended(reason);
+            close();
+        });
+    }
+    private void join(String deviceId) {
+        if (handle == 0 || joining) return;
+        joining = true;
+        if (!nConnect(handle, deviceId, remote, password)) fail(L10n.tr("无法发起远程连接"));
+        password = "";
+    }
+    // Called on arbitrary native callback threads; borrowed payloads were copied by JNI.
+    @SuppressWarnings("unused") private void onNativeEvent(int type, byte[] bytes) {
+        execute(() -> {
+            String value = new String(bytes, StandardCharsets.UTF_8);
+            try {
+                if (type == 3) {
+                    if (value.contains("@")) {
+                        identity = value;
+                        secrets.put(scope, identity);
+                    } else if (!identity.startsWith(value + "@")) identity = value;
+                    publishSignaling(); return;
+                }
+                if (type == 6) { ui(() -> listener.clipboard(value)); return; }
+                JSONObject event = new JSONObject(value);
+                if (type == 1) {
+                    int status = event.getInt("status");
+                    if (!event.getBoolean("controller")) {
+                        long generation=event.optLong("generation");
+                        if(signalGeneration!=generation){signalGeneration=generation;presenceRequested=false;}
+                        signalState = status;
+                        signalReady = status == 1;
+                        if (signalReady && remote.isEmpty()) main.removeCallbacks(timeout);
+                        publishSignaling();
+                    }
+                    if (status == 6) fail(L10n.tr("服务器 TLS 证书校验失败"));
+                    else if (status == 2) fail(L10n.tr("服务器登录失败，请检查服务器地址和网络"));
+                    else if (status >= 3 && connected) fail(L10n.tr("信令连接中断，请重新连接"));
+                    else if (!remote.isEmpty() && (status == 0 || status == 4)) ui(() -> listener.status(L10n.tr("正在连接信令服务器…")));
+                } else if (type == 2) {
+                    int status = event.getInt("status");
+                    if (status == 1) {
+                        if (connected) return; // Repeated transport readiness is the same desktop session.
+                        connected = true; main.removeCallbacks(timeout);
+                        nReady(handle,resolutionStore.load(host,port,remote).toString().getBytes(StandardCharsets.UTF_8));
+                        audio = new AudioPlayer();
+                        nControl(handle, 2, 1);
+                        ui(() -> { listener.connected(); if(!closed){statisticsTick.run();fileTick.run();} });
+                    } else if (status == 0 || status == 2) ui(() -> listener.status(L10n.tr("正在建立安全连接…")));
+                    else if (status == 6) ui(() -> { listener.passwordRejected(); close(); });
+                    else {
+                        String[] reasons = {"", "", "", L10n.tr("连接已断开"), L10n.tr("连接失败"), L10n.tr("远端已关闭连接"),
+                                L10n.tr("远端密码错误"), L10n.tr("找不到该设备 ID"), L10n.tr("远端当前不可用")};
+                        if (direct && status == 4) fail(L10n.tr("IP 直连失败，请检查电脑的直连地址和网络。"));
+                        else fail(status >= 0 && status < reasons.length ? reasons[status] : L10n.tr("连接已结束"));
+                    }
+                } else if (type == 4) {
+                    if(event.optInt("type",-1)==14){
+                        networkStatistics.receiveRemoteEncoder(event.getJSONObject("video_codec").getString("encoder"));
+                        return;
+                    }
+                    JSONObject info=event.optJSONObject("host_info");
+                    if(info!=null)supportsTextInput=info.optBoolean("supports_text_input",false);
+                    ui(() -> {
+                        if(event.optInt("type",-1)==10){
+                            privacyScreen.receive(event,android.os.SystemClock.elapsedRealtime());
+                            listener.privacyChanged();
+                        } else if(event.optInt("type",-1)==5){
+                            JSONObject service=event.optJSONObject("service_status");
+                            privacyScreen.setInteractiveStage(service==null?"":service.optString("interactive_stage",""));
+                            listener.privacyChanged();
+                        }
+                        listener.data(event);
+                    });
+                }
+                else if (type == 5) {
+                    int width = event.getInt("width"), height = event.getInt("height");
+                    ui(() -> listener.videoSize(width, height));
+                } else if (type == 7) networkStatistics.receive(new RemoteNetworkStatistics.Report(event),RemoteNetworkStatistics.now());
+                else if (type == 8 && signalReady) ui(() -> listener.announcement(event));
+                else if (type == 9 && signalReady && presenceRequested) {
+                    long generation=event.optLong("generation");
+                    if(generation==signalGeneration)ui(()->{if(generation==signalGeneration)listener.presence(event);});
+                } else if(type==10){
+                    String name=event.getString("name"),path=event.optString("path");
+                    double progress=event.getDouble("progress");boolean sending=event.getBoolean("sending");
+                    ui(()->{if(sending&&(progress<0||progress>=1))sendingFile=false;
+                        listener.fileTransfer(name,progress,sending,path.isEmpty()?null:new File(path));});
+                }
+            } catch (Exception error) {
+                if (type == 3) fail(L10n.tr("设备身份保存失败，请检查安全存储"));
+            }
+        });
+    }
+    @SuppressWarnings("unused") private void onNativeAudio(byte[] pcm) {
+        AudioPlayer player = audio;
+        if (!closed && player != null) player.offer(pcm);
+    }
+    @SuppressWarnings("unused") private void onNativeVideoFrame(long id,double latency,int width,int height){
+        if(!closed)networkStatistics.frame(id,latency,width,height,RemoteNetworkStatistics.now());
+    }
+    void videoSettings(RemoteVideoSettings.Values settings,long requestId){
+        if(!settings.valid()||requestId<0||requestId>0xffffffffL)return;
+        execute(()->{if(connected&&!nVideoSettings(handle,settings.quality,settings.frameRate,settings.preference,requestId))ui(()->listener.data(settings.status(requestId,false)));});
+    }
+    void displayResolution(RemoteDisplayResolutions.Request request){
+        execute(()->{if(!connected||!nDisplayResolution(handle,request.displayId,request.displayKey,request.mode.width,request.mode.height,request.id))ui(()->listener.displayResolutionFailed(request.id));});
+    }
+    void rememberDisplayResolution(String displayKey,RemoteDisplayResolutions.Mode mode){
+        if(!closed&&connected)resolutionStore.remember(host,port,remote,displayKey,mode);
+    }
+    void announcementRequest(JSONObject request,String requestId){
+        byte[] bytes=request.toString().getBytes(StandardCharsets.UTF_8);
+        execute(()->{if(!signalReady||identity.isEmpty()||!nAnnouncementRequest(handle,bytes))ui(()->listener.announcementFailed(requestId));});
+    }
+    void presenceRequest(JSONArray ids){
+        // Own the caller's list before crossing to the serialized RTC executor.
+        String devices=ids.toString();
+        execute(()->{
+            if(!signalReady||identity.isEmpty())return;
+            try{
+                JSONObject request=new JSONObject().put("type","recent_connections_presence")
+                    .put("user_id",identity.split("@",2)[0]).put("devices",new JSONArray(devices)).put("subscribe",true);
+                if(nPresenceRequest(handle,request.toString().getBytes(StandardCharsets.UTF_8)))presenceRequested=true;
+            }catch(org.json.JSONException ignored){ }
+        });
+    }
+    void surface(Surface value) { execute(() -> { surface = value; if (handle != 0) nSurface(handle, value); }); }
+    void pointer(float x, float y, int flag, int wheel) { execute(() -> { if (connected) nPointer(handle, x, y, flag, wheel); }); }
+    void key(int code, boolean down) { execute(() -> { if (connected) nKey(handle, code, down); }); }
+    void chord(int code,int[] modifiers) {
+        if(closed||!connected)return;
+        int[] keys=RemoteShortcuts.normalize(modifiers);
+        execute(()->{
+            if(!connected)return;
+            try{for(int modifier:keys)nKey(handle,modifier,true);nKey(handle,code,true);}
+            finally{nKey(handle,code,false);for(int i=keys.length-1;i>=0;i--)nKey(handle,keys[i],false);}
+        });
+    }
+    boolean textEdit(int deletions,String text) {
+        byte[] bytes=text.getBytes(StandardCharsets.UTF_8);
+        boolean unicode=supportsTextInput;
+        if(closed||!connected||deletions<0||deletions>4096||bytes.length>16*1024||text.indexOf('\0')>=0)return false;
+        if(!unicode)for(char ch:text.toCharArray())if(KeyMap.ascii(ch)==0)return false;
+        // Validate the entire edit before deleting anything. One RTC task preserves order.
+        execute(()->{
+            if(!connected)return;
+            for(int i=0;i<deletions;i++){nKey(handle,8,true);nKey(handle,8,false);}
+            if(unicode){if(bytes.length>0)nText(handle,bytes);}
+            else for(char ch:text.toCharArray()){
+                int code=KeyMap.ascii(ch);boolean shift=(code&0x100)!=0;
+                if(shift)nKey(handle,16,true);nKey(handle,code&255,true);nKey(handle,code&255,false);if(shift)nKey(handle,16,false);
+            }
+        });
+        return true;
+    }
+    void control(int type, int value) {
+        AudioPlayer player = audio;
+        if (type == 2 && player != null) player.setEnabled(value != 0);
+        execute(() -> { if (connected){nControl(handle, type, value);if(type==4)networkStatistics.resetVideo();} });
+    }
+    void lockPrivacy() { sendPrivacy(true); }
+    void togglePrivacy() { sendPrivacy(false); }
+    private void sendPrivacy(boolean lock) {
+        if(closed||!connected)return;
+        boolean enable=!privacyScreen.active();
+        long request=privacyScreen.begin(android.os.SystemClock.elapsedRealtime(),lock);
+        if(request<0)return;
+        listener.privacyChanged();
+        execute(()->{if(connected&&!nPrivacy(handle,lock?3:enable?1:2,true))ui(()->{
+            privacyScreen.failed(request);listener.privacyChanged();
+        });});
+    }
+    void sendClipboard(byte[] bytes) {
+        execute(() -> {
+            boolean sent = connected && nClipboard(handle, bytes);
+            ui(() -> listener.controlFeedback(sent ? L10n.tr("已发送，请在远端粘贴") : L10n.tr("指令发送失败，请重试")));
+        });
+    }
+    void secureAttention(){execute(()->{
+        boolean sent=connected&&nSecureAttention(handle);
+        ui(()->listener.controlFeedback(sent?L10n.tr("已发送 Ctrl+Alt+Del"):L10n.tr("指令发送失败，请重试")));
+    });}
+    void sendFile(android.net.Uri uri){
+        if(closed)return;
+        if(sendingFile){listener.controlFeedback(L10n.tr("请等待当前文件发送完成"));return;}
+        sendingFile=true;listener.fileTransfer(L10n.tr("正在读取所选文件…"),0,true,null);
+        documents.prepare(uri,new SessionDocuments.Prepared(){
+            public void ready(File file,String name){execute(()->{
+                if(!connected||!nSendFile(handle,file.getAbsolutePath(),name.getBytes(StandardCharsets.UTF_8))){
+                    file.delete();ui(()->{sendingFile=false;listener.fileTransfer(name,-1,true,null);});
+                }
+            });}
+            public void failed(){ui(()->{sendingFile=false;listener.fileTransfer(L10n.tr("所选文件（无法读取或空间不足）"),-1,true,null);});}
+        });
+    }
+    void saveFile(File file,android.net.Uri destination){
+        if(closed)return;
+        documents.save(file,destination,success->ui(()->listener.controlFeedback(success?L10n.tr("文件已保存"):L10n.tr("文件保存失败，请重试"))));
+    }
+    @Override public void close() {
+        if (closed) return;
+        closed = true; main.removeCallbacks(timeout);main.removeCallbacks(statisticsTick);main.removeCallbacks(fileTick);
+        RTC.execute(() -> {
+            main.removeCallbacks(timeout);
+            if (audio != null) { audio.close(); audio = null; }
+            password = "";
+            if (handle != 0) { nDestroy(handle); handle = 0; }
+            documents.close();
+            surface = null;
+        });
+    }
+    static native boolean nValidAppVersion(String version);
+    static native boolean nHasAppUpdate(String version, byte[] releaseJson);
+    static native String nCheckMobileUpdate(String version, byte[] releaseJson);
+    private static native long nCreate(NativeSession owner, String host, int port, String identity, String logs, String roots, String trustKey, boolean controllerOnly);
+    private static native String nGenerateTrustKey();
+    private static native String nTrustInfo(String seed, String deviceId);
+    static native String directEndpoint(String input);
+    private static native boolean nConnect(long handle, String identity, String remote, String password);
+    private static native void nReady(long handle,byte[] displayResolutions);
+    private static native void nPointer(long handle, float x, float y, int flag, int wheel);
+    private static native void nKey(long handle, int code, boolean down);
+    private static native void nText(long handle,byte[] text);
+    private static native void nControl(long handle, int type, int value);
+    private static native boolean nDisplayResolution(long handle,int displayId,String displayKey,int width,int height,long requestId);
+    private static native boolean nVideoSettings(long handle,int quality,int frameRate,int preference,long requestId);
+    private static native boolean nAnnouncementRequest(long handle,byte[] data);
+    private static native boolean nPresenceRequest(long handle,byte[] data);
+    private static native boolean nClipboard(long handle, byte[] data);
+    private static native boolean nSecureAttention(long handle);
+    private static native boolean nPrivacy(long handle,int flag,boolean blockLocalInput);
+    private static native void nFileDirectory(long handle,String directory);
+    private static native boolean nSendFile(long handle,String path,byte[] name);
+    private static native boolean nPumpFiles(long handle);
+    private static native void nSurface(long handle, Surface surface);
+    private static native void nDestroy(long handle);
+}

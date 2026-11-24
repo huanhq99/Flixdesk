@@ -1,0 +1,15 @@
+// Session helper icon and manifest resources.
+IDI_ICON1 ICON "crossdesk.ico"
+
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
+#define RT_MANIFEST 24
+
+// The service supplies either the user's token (desktop observer) or a SYSTEM
+// token (secure capture/input). Requiring elevation here prevents the observer
+// from starting with CreateProcessAsUserW in installed release builds (740).
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "crossdesk_session_helper.manifest"
+
+#define CROSSDESK_FILE_DESCRIPTION "CrossDesk Session Helper"
+#define CROSSDESK_ORIGINAL_FILENAME "crossdesk_session_helper.exe"
+
+#include "version_info.rcinc"

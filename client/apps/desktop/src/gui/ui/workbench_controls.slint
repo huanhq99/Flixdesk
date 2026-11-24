@@ -1,0 +1,200 @@
+import { FlatSurface, UiSurface } from "ui_surface.slint";
+import { UiRadius } from "ui_radius.slint";
+import { ControlStyle, ButtonStyle } from "common.slint";
+// Colors and spacing for the connection workbench; shapes are shared app-wide.
+export global WorkbenchStyle {
+    out property <color> canvas: #edf2f8;
+    out property <color> surface: #ffffff;
+    out property <color> field-surface: #f5f7fb;
+    out property <color> hover-surface: ControlStyle.hover;
+    out property <color> pressed-surface: ControlStyle.pressed;
+    out property <color> separator: #e1e7ef;
+    out property <color> text: #1c2940;
+    out property <color> muted: #69788e;
+    out property <color> accent: #3564e3;
+    out property <color> success: #18835a;
+}
+
+export component WorkbenchButton inherits FlatSurface {
+    in property <string> text;
+    in property <length> text-size: 13px;
+    in property <color> text-color: root.destructive || root.primary ? white : WorkbenchStyle.text;
+    in property <color> normal-outline-color: ButtonStyle.border;
+    in property <color> normal-background: ButtonStyle.surface;
+    in property <color> hover-background: ButtonStyle.hover;
+    in property <color> pressed-background: ButtonStyle.pressed;
+    in property <string> icon;
+    in property <string> tooltip;
+    in property <bool> tooltip-above: false;
+    in property <bool> tooltip-align-left: false;
+    in property <bool> tooltip-suppressed: false;
+    in property <color> icon-color: root.destructive ? white : root.primary
+        ? (root.soft && !touch.has-hover && !root.show-focus ? WorkbenchStyle.accent : white)
+        : ControlStyle.icon;
+    in property <bool> primary: false;
+    in property <bool> destructive: false;
+    in property <bool> soft: false;
+    in property <bool> quiet: false;
+    in property <bool> enabled: true;
+    in property <MouseCursor> mouse-cursor: pointer;
+    out property <bool> has-focus: button-focus.has-focus;
+    private property <bool> keyboard-focus: false;
+    private property <bool> show-focus: button-focus.has-focus && root.keyboard-focus;
+    private property <bool> tooltip-active: root.enabled && root.tooltip != ""
+        && !root.tooltip-suppressed && !touch.pressed
+        && (touch.has-hover || root.show-focus);
+    private property <bool> tooltip-visible: false;
+    changed tooltip-active => { root.tooltip-visible = false; }
+    callback clicked;
+    width: 112px;
+    height: 36px;
+    border-radius: UiRadius.control;
+    outline-enabled: root.show-focus || (!root.quiet && !root.soft && !root.primary && !root.destructive);
+    outline-focused: root.show-focus;
+    outline-color: !root.enabled ? ButtonStyle.disabled-border
+        : root.show-focus ? WorkbenchStyle.accent
+        : touch.pressed ? ButtonStyle.pressed-border
+        : touch.has-hover ? ButtonStyle.hover-border : root.normal-outline-color;
+    background: root.destructive
+        ? (touch.pressed ? #912018 : touch.has-hover ? #b42318 : #d92d20)
+        : root.soft
+        ? (root.primary
+            ? (touch.pressed ? #254cc0 : touch.has-hover || root.show-focus ? WorkbenchStyle.accent : #dce7ff)
+            : (touch.pressed ? ButtonStyle.pressed : touch.has-hover ? ButtonStyle.hover : ButtonStyle.surface))
+        : root.primary
+        ? (touch.pressed ? #254cc0 : touch.has-hover ? #4574f0 : WorkbenchStyle.accent)
+        : (touch.pressed ? root.pressed-background : touch.has-hover ? root.hover-background : root.quiet ? transparent : root.normal-background);
+    opacity: root.enabled ? 1 : 0.45;
+    animate background, outline-color { duration: 120ms; }
+    forward-focus: button-focus;
+    accessible-role: button;
+    accessible-label: root.tooltip != "" ? root.tooltip : root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if root.enabled { root.clicked(); } }
+
+    HorizontalLayout {
+        padding-left: root.text == "" ? 0px : 10px;
+        padding-right: root.text == "" ? 0px : 10px;
+        spacing: 8px;
+        alignment: center;
+        if root.icon != "": Text {
+            text: root.icon;
+            font-family: "Font Awesome 6 Free";
+            font-weight: 900;
+            font-size: root.soft ? 12px : 14px;
+            color: root.icon-color;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+        if root.text != "": Text {
+            text: root.text;
+            font-size: root.text-size;
+            font-weight: root.primary ? 600 : 500;
+            color: root.text-color;
+            vertical-alignment: center;
+            accessible-role: none;
+        }
+    }
+    if root.show-focus && (root.primary || root.destructive): Rectangle {
+        x: 3px; y: 3px; width: parent.width - 6px; height: parent.height - 6px;
+        border-radius: max(0px, root.border-radius - 3px);
+        border-width: 1px; border-color: white;
+    }
+    button-focus := FocusScope {
+        enabled: root.enabled;
+        focus-gained(reason) => {
+            root.keyboard-focus = reason == FocusReason.tab-navigation;
+        }
+        focus-lost => { root.keyboard-focus = false; }
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " {
+                root.keyboard-focus = true;
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+        touch := TouchArea {
+            enabled: root.enabled;
+            mouse-cursor: root.mouse-cursor;
+            pointer-event(event) => {
+                if event.kind == PointerEventKind.down {
+                    root.keyboard-focus = false;
+                }
+            }
+            // Keep focus for subsequent keyboard activation without leaving a
+            // keyboard focus ring behind after a pointer click.
+            clicked => { button-focus.focus(); root.keyboard-focus = false; root.clicked(); }
+        }
+    }
+    tooltip-timer := Timer {
+        interval: 450ms;
+        running: root.tooltip-active && !root.tooltip-visible;
+        triggered => { root.tooltip-visible = true; }
+    }
+    if root.tooltip-active && root.tooltip-visible: Rectangle {
+        x: root.tooltip-align-left ? 0px : min(0px, root.width - self.width);
+        y: root.tooltip-above ? -self.height - 6px : root.height + 6px;
+        width: min(260px, tip.preferred-width + 20px);
+        height: max(28px, tip.preferred-height + 12px);
+        background: #24324a;
+        border-radius: UiRadius.control;
+        z: 20;
+        tip := Text {
+            x: 10px; y: 6px;
+            width: parent.width - 20px;
+            height: parent.height - 12px;
+            text: root.tooltip;
+            font-size: 12px;
+            color: white;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// A raised surface keeps transient action feedback distinct from the workbench.
+export component WorkbenchNotice inherits FlatSurface {
+    in property <string> text;
+    in property <string> icon;
+    in property <bool> error: false;
+    in property <length> width-limit: 360px;
+    private property <color> foreground: root.error ? #b42318 : #146c49;
+    width: min(root.width-limit, max(280px, message.preferred-width + 64px));
+    height: 64px;
+    background: root.error ? #fff1f0 : #e9f6ef;
+    outline-color: root.error ? UiSurface.error : UiSurface.edge;
+    border-radius: UiRadius.surface;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    Text {
+        x: message.x - 28px; width: 18px; height: parent.height;
+        text: root.icon;
+        font-family: "Font Awesome 6 Free";
+        font-weight: 900;
+        font-size: 16px;
+        color: root.foreground;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+    message := Text {
+        x: (parent.width - self.width + 28px) / 2;
+        width: min(self.preferred-width, parent.width - 64px);
+        height: parent.height;
+        text: root.text;
+        font-size: 14px;
+        font-weight: 600;
+        color: root.foreground;
+        overflow: elide;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}
+
+export component WorkbenchCard inherits FlatSurface {
+    background: WorkbenchStyle.surface;
+    outline-color: UiSurface.edge;
+    border-radius: UiRadius.surface;
+}

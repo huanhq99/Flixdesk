@@ -1,0 +1,487 @@
+#include "wgc_session_impl.h"
+
+#include <Windows.Graphics.Capture.Interop.h>
+
+#include <string>
+
+#include "rd_log.h"
+
+namespace crossdesk {
+
+extern "C" {
+HRESULT __stdcall CreateDirect3D11DeviceFromDXGIDevice(
+    ::IDXGIDevice* dxgiDevice, ::IInspectable** graphicsDevice);
+}
+
+WgcSessionImpl::WgcSessionImpl(int id) : id_(id) {}
+
+WgcSessionImpl::~WgcSessionImpl() {
+  Stop();
+  CleanUp();
+}
+
+void WgcSessionImpl::Release() { delete this; }
+
+int WgcSessionImpl::Initialize(HWND hwnd) {
+  std::lock_guard locker(lock_);
+
+  target_.hwnd = hwnd;
+  target_.is_window = true;
+  return InitializeLocked();
+}
+
+int WgcSessionImpl::Initialize(HMONITOR hmonitor) {
+  std::lock_guard locker(lock_);
+
+  target_.hmonitor = hmonitor;
+  target_.is_window = false;
+  return InitializeLocked();
+}
+
+void WgcSessionImpl::RegisterObserver(wgc_session_observer* observer) {
+  std::lock_guard locker(lock_);
+  observer_ = observer;
+}
+
+int WgcSessionImpl::Start(bool show_cursor) {
+  std::lock_guard locker(lock_);
+
+  return StartLocked(show_cursor);
+}
+
+int WgcSessionImpl::Stop() {
+  std::lock_guard locker(lock_);
+
+  CleanUpLocked();
+  return 0;
+}
+
+int WgcSessionImpl::Pause() {
+  std::lock_guard locker(lock_);
+
+  is_paused_ = true;
+
+  if (!is_initialized_) {
+    LOG_ERROR("AE_NEED_INIT");
+    return 4;
+  }
+  return 0;
+}
+
+int WgcSessionImpl::Resume() {
+  std::lock_guard locker(lock_);
+
+  is_paused_ = false;
+
+  if (!is_initialized_) {
+    LOG_ERROR("AE_NEED_INIT");
+    return 4;
+  }
+  return 0;
+}
+
+auto WgcSessionImpl::CreateD3D11Device() {
+  winrt::com_ptr<ID3D11Device> d3d_device;
+  HRESULT hr;
+
+  WINRT_ASSERT(!d3d_device);
+
+  D3D_DRIVER_TYPE type = D3D_DRIVER_TYPE_HARDWARE;
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  hr = D3D11CreateDevice(nullptr, type, nullptr, flags, nullptr, 0,
+                         D3D11_SDK_VERSION, d3d_device.put(), nullptr, nullptr);
+
+  if (DXGI_ERROR_UNSUPPORTED == hr) {
+    // change D3D_DRIVER_TYPE
+    type = D3D_DRIVER_TYPE_WARP;
+    hr = D3D11CreateDevice(nullptr, type, nullptr, flags, nullptr, 0,
+                           D3D11_SDK_VERSION, d3d_device.put(), nullptr,
+                           nullptr);
+  }
+
+  winrt::check_hresult(hr);
+
+  winrt::com_ptr<::IInspectable> d3d11_device;
+  winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(
+      d3d_device.as<IDXGIDevice>().get(), d3d11_device.put()));
+  return d3d11_device
+      .as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+}
+
+auto WgcSessionImpl::CreateCaptureItemForWindow(HWND hwnd) {
+  auto activation_factory = winrt::get_activation_factory<
+      winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
+  auto interop_factory = activation_factory.as<IGraphicsCaptureItemInterop>();
+  winrt::Windows::Graphics::Capture::GraphicsCaptureItem item = {nullptr};
+  winrt::check_hresult(interop_factory->CreateForWindow(
+      hwnd,
+      winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+      reinterpret_cast<void**>(winrt::put_abi(item))));
+  return item;
+}
+
+auto WgcSessionImpl::CreateCaptureItemForMonitor(HMONITOR hmonitor) {
+  auto activation_factory = winrt::get_activation_factory<
+      winrt::Windows::Graphics::Capture::GraphicsCaptureItem>();
+  auto interop_factory = activation_factory.as<IGraphicsCaptureItemInterop>();
+  winrt::Windows::Graphics::Capture::GraphicsCaptureItem item = {nullptr};
+  winrt::check_hresult(interop_factory->CreateForMonitor(
+      hmonitor,
+      winrt::guid_of<ABI::Windows::Graphics::Capture::IGraphicsCaptureItem>(),
+      reinterpret_cast<void**>(winrt::put_abi(item))));
+  return item;
+}
+
+HRESULT WgcSessionImpl::CreateMappedTexture(
+    winrt::com_ptr<ID3D11Texture2D> src_texture, unsigned int width,
+    unsigned int height) {
+  D3D11_TEXTURE2D_DESC src_desc;
+  src_texture->GetDesc(&src_desc);
+  D3D11_TEXTURE2D_DESC map_desc;
+  map_desc.Width = width == 0 ? src_desc.Width : width;
+  map_desc.Height = height == 0 ? src_desc.Height : height;
+  map_desc.MipLevels = src_desc.MipLevels;
+  map_desc.ArraySize = src_desc.ArraySize;
+  map_desc.Format = src_desc.Format;
+  map_desc.SampleDesc = src_desc.SampleDesc;
+  map_desc.Usage = D3D11_USAGE_STAGING;
+  map_desc.BindFlags = 0;
+  map_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+  map_desc.MiscFlags = 0;
+
+  auto d3dDevice =
+      GetDXGIInterfaceFromObject<ID3D11Device>(d3d11_direct_device_);
+
+  return d3dDevice->CreateTexture2D(&map_desc, nullptr,
+                                    d3d11_texture_mapped_.put());
+}
+
+int WgcSessionImpl::StartCaptureLocked(bool show_cursor) {
+  if (!is_initialized_) {
+    LOG_ERROR("AE_NEED_INIT");
+    return 4;
+  }
+  if (!capture_item_) {
+    LOG_ERROR("WGC: capture item is null");
+    return 4;
+  }
+
+  try {
+    if (!capture_session_) {
+      auto current_size = capture_item_.Size();
+      capture_framepool_ =
+          winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::
+              CreateFreeThreaded(d3d11_direct_device_,
+                                 winrt::Windows::Graphics::DirectX::
+                                     DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                                 2, current_size);
+      capture_session_ = capture_framepool_.CreateCaptureSession(capture_item_);
+      capture_frame_size_ = current_size;
+      capture_framepool_trigger_ = capture_framepool_.FrameArrived(
+          winrt::auto_revoke, {this, &WgcSessionImpl::OnFrame});
+      capture_close_trigger_ = capture_item_.Closed(
+          winrt::auto_revoke, {this, &WgcSessionImpl::OnClosed});
+    }
+
+    if (!capture_framepool_ || !capture_session_) {
+      throw std::exception();
+    }
+
+    capture_session_.IsCursorCaptureEnabled(show_cursor);
+    LOG_INFO("WGC: session {} cursor capture enabled={}", id_,
+             capture_session_.IsCursorCaptureEnabled());
+    capture_session_.StartCapture();
+    is_running_ = true;
+    return 0;
+  } catch (const winrt::hresult_error& error) {
+    LOG_ERROR("WGC: start capture failed, hr=0x{:08X}, thread={}",
+              static_cast<uint32_t>(error.code().value), GetCurrentThreadId());
+    return 86;
+  } catch (...) {
+    LOG_ERROR("AE_WGC_CREATE_CAPTURER_FAILED");
+    return 86;
+  }
+}
+
+int WgcSessionImpl::StartLocked(bool show_cursor) {
+  const bool was_paused = is_paused_;
+  if (is_running_) {
+    if (last_show_cursor_ == show_cursor) return 0;
+    // Replace the pool along with the setting, so buffered frames from the
+    // previous cursor mode cannot be labeled with the new mode.
+    StopLocked();
+  }
+
+  last_show_cursor_ = show_cursor;
+  if (!is_initialized_) {
+    const int init_ret = InitializeLocked();
+    if (init_ret != 0) {
+      return init_ret;
+    }
+  }
+
+  int ret = StartCaptureLocked(show_cursor);
+  if (ret == 0) {
+    return 0;
+  }
+
+  LOG_WARN("WGC: start capture failed, rebuilding capture item");
+  CleanUpLocked();
+  is_paused_ = was_paused;
+  ret = InitializeLocked();
+  if (ret != 0) {
+    return ret;
+  }
+  return StartCaptureLocked(show_cursor);
+}
+
+void WgcSessionImpl::StopLocked() {
+  is_running_ = false;
+
+  // if (loop_.joinable()) loop_.join();
+
+  if (capture_framepool_trigger_) capture_framepool_trigger_.revoke();
+  if (capture_close_trigger_) capture_close_trigger_.revoke();
+
+  if (capture_session_) {
+    try {
+      capture_session_.Close();
+    } catch (...) {
+      LOG_WARN("WGC: capture session close failed");
+    }
+    capture_session_ = nullptr;
+  }
+
+  if (capture_framepool_) {
+    try {
+      capture_framepool_.Close();
+    } catch (...) {
+      LOG_WARN("WGC: frame pool close failed");
+    }
+    capture_framepool_ = nullptr;
+  }
+
+  d3d11_texture_mapped_ = nullptr;
+}
+
+void WgcSessionImpl::OnFrame(
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender,
+    [[maybe_unused]] winrt::Windows::Foundation::IInspectable const& args) {
+  std::lock_guard locker(lock_);
+
+  if (!is_running_ || sender != capture_framepool_) return;
+
+  try {
+    auto frame = sender.TryGetNextFrame();
+    if (!frame || is_paused_) return;
+    const auto frame_size = frame.ContentSize();
+    if (frame_size.Width <= 0 || frame_size.Height <= 0) return;
+
+    if (frame_size.Width != capture_frame_size_.Width ||
+        frame_size.Height != capture_frame_size_.Height) {
+      // ContentSize already describes the new content, while this surface
+      // still belongs to the old pool. Retire it before mapping any pixels.
+      frame.Close();
+      d3d11_texture_mapped_ = nullptr;
+      capture_framepool_.Recreate(
+          d3d11_direct_device_,
+          winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+          2, frame_size);
+      capture_frame_size_ = frame_size;
+      return;
+    }
+
+    auto frame_captured =
+        GetDXGIInterfaceFromObject<ID3D11Texture2D>(frame.Surface());
+    D3D11_TEXTURE2D_DESC desc{};
+    frame_captured->GetDesc(&desc);
+    if (desc.Width != static_cast<UINT>(frame_size.Width) ||
+        desc.Height != static_cast<UINT>(frame_size.Height) ||
+        desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+      return;
+    }
+    if (!d3d11_texture_mapped_) {
+      HRESULT tex_hr = CreateMappedTexture(frame_captured);
+      if (FAILED(tex_hr)) {
+        ReportFrameFailure(tex_hr);
+        return;
+      }
+    }
+
+    d3d11_device_context_->CopyResource(d3d11_texture_mapped_.get(),
+                                        frame_captured.get());
+
+    D3D11_MAPPED_SUBRESOURCE map_result;
+    HRESULT hr = d3d11_device_context_->Map(
+        d3d11_texture_mapped_.get(), 0, D3D11_MAP_READ,
+        0 /*coz we use CreateFreeThreaded, so we cant use flags
+             D3D11_MAP_FLAG_DO_NOT_WAIT*/
+        ,
+        &map_result);
+    if (FAILED(hr)) {
+      ReportFrameFailure(hr);
+      return;
+    }
+
+    {
+      struct UnmapOnExit {
+        ID3D11DeviceContext* context;
+        ID3D11Texture2D* texture;
+        ~UnmapOnExit() { context->Unmap(texture, 0); }
+      } unmap{d3d11_device_context_.get(), d3d11_texture_mapped_.get()};
+      // copy data from map_result.pData
+      if (map_result.pData && observer_) {
+        CURSORINFO cursor{};
+        cursor.cbSize = sizeof(cursor);
+        const bool cursor_captured =
+            last_show_cursor_ && GetCursorInfo(&cursor) && cursor.hCursor &&
+            (cursor.flags & CURSOR_SHOWING) != 0 &&
+            (target_.is_window ||
+             MonitorFromPoint(cursor.ptScreenPos, MONITOR_DEFAULTTONULL) ==
+                 target_.hmonitor);
+        observer_->OnFrame(
+            wgc_session_frame{static_cast<unsigned int>(frame_size.Width),
+                              static_cast<unsigned int>(frame_size.Height),
+                              map_result.RowPitch,
+                              const_cast<const unsigned char*>(
+                                  (unsigned char*)map_result.pData),
+                              cursor_captured},
+            id_);
+        frame_failure_reported_ = false;
+      }
+    }
+  } catch (const winrt::hresult_error& error) {
+    ReportFrameFailure(error.code());
+  } catch (...) {
+    ReportFrameFailure(E_FAIL);
+  }
+}
+
+void WgcSessionImpl::ReportFrameFailure(HRESULT error) {
+  if (frame_failure_reported_) return;
+  frame_failure_reported_ = true;
+  LOG_WARN("WGC: frame processing failed, hr=0x{:08X}", static_cast<uint32_t>(error));
+  // Let both normal and secure capture advance to GDI rather than replay a
+  // stale image indefinitely after a readback/device failure.
+  if (observer_) observer_->OnFrame({}, id_);
+}
+
+void WgcSessionImpl::OnClosed(
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem const&,
+    winrt::Windows::Foundation::IInspectable const&) {
+  std::lock_guard locker(lock_);
+  if (observer_) observer_->OnFrame({}, id_);
+  const bool was_running = is_running_;
+  const bool was_paused = is_paused_;
+  try {
+    CleanUpLocked();
+    is_paused_ = was_paused;
+    if (InitializeLocked() == 0) {
+      int ret = was_running ? StartCaptureLocked(last_show_cursor_) : 0;
+      if (ret == 0) {
+        OutputDebugStringW(L"WgcSessionImpl::OnClosed: auto recovered");
+      } else {
+        OutputDebugStringW(L"WgcSessionImpl::OnClosed: recover Start failed");
+      }
+    } else {
+      OutputDebugStringW(
+          L"WgcSessionImpl::OnClosed: recover Initialize failed");
+    }
+  } catch (...) {
+    OutputDebugStringW(L"WgcSessionImpl::OnClosed: exception during recover");
+  }
+}
+
+int WgcSessionImpl::InitializeLocked() {
+  if (is_initialized_) return 0;
+
+  d3d11_texture_mapped_ = nullptr;
+  d3d11_device_context_ = nullptr;
+  d3d11_direct_device_ = nullptr;
+  capture_frame_size_ = {};
+
+  if (!(d3d11_direct_device_ = CreateD3D11Device())) {
+    LOG_ERROR("AE_D3D_CREATE_DEVICE_FAILED");
+    return 1;
+  }
+
+  try {
+    if (target_.is_window)
+      capture_item_ = CreateCaptureItemForWindow(target_.hwnd);
+    else
+      capture_item_ = CreateCaptureItemForMonitor(target_.hmonitor);
+    if (!capture_item_) {
+      LOG_ERROR("WGC: create capture item returned null");
+      return 86;
+    }
+
+    // Set up
+    auto d3d11_device =
+        GetDXGIInterfaceFromObject<ID3D11Device>(d3d11_direct_device_);
+    d3d11_device->GetImmediateContext(d3d11_device_context_.put());
+
+  } catch (const winrt::hresult_error& error) {
+    LOG_ERROR("WGC: create capture item failed, hr=0x{:08X}, thread={}",
+              static_cast<uint32_t>(error.code().value), GetCurrentThreadId());
+    return 86;
+  } catch (...) {
+    return 86;
+  }
+
+  is_initialized_ = true;
+
+  return 0;
+}
+
+void WgcSessionImpl::CleanUp() {
+  std::lock_guard locker(lock_);
+
+  CleanUpLocked();
+}
+
+void WgcSessionImpl::CleanUpLocked() {
+  StopLocked();
+
+  capture_item_ = nullptr;
+  d3d11_device_context_ = nullptr;
+  d3d11_direct_device_ = nullptr;
+  capture_frame_size_ = {};
+  is_initialized_ = false;
+  is_paused_ = false;
+}
+
+LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w_param,
+                            LPARAM l_param) {
+  return DefWindowProc(window, message, w_param, l_param);
+}
+
+// void WgcSessionImpl::message_func() {
+//   const std::wstring kClassName = L"am_fake_window";
+
+//   WNDCLASS wc = {};
+
+//   wc.style = CS_HREDRAW | CS_VREDRAW;
+//   wc.lpfnWndProc = DefWindowProc;
+//   wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+//   wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW);
+//   wc.lpszClassName = kClassName.c_str();
+
+//   if (!::RegisterClassW(&wc)) return;
+
+//   hwnd_ = ::CreateWindowW(kClassName.c_str(), nullptr, WS_OVERLAPPEDWINDOW,
+//   0,
+//                           0, 0, 0, nullptr, nullptr, nullptr, nullptr);
+//   MSG msg;
+//   while (is_running_) {
+//     while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+//       if (!is_running_) break;
+//       TranslateMessage(&msg);
+//       DispatchMessage(&msg);
+//     }
+//     Sleep(10);
+//   }
+
+//   ::CloseWindow(hwnd_);
+//   ::DestroyWindow(hwnd_);
+// }
+}  // namespace crossdesk

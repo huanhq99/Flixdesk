@@ -1,0 +1,75 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2026-09-04
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _APPLICATION_STATE_H_
+#define _APPLICATION_STATE_H_
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <string>
+
+namespace crossdesk::gui_detail {
+
+struct MainWindowState {
+  bool exit_ = false;
+};
+
+// Application-global interaction flags that coordinate UI events with media
+// and remote-control devices.
+struct InteractionState {
+  bool start_mouse_controller_ = false;
+  bool mouse_controller_is_started_ = false;
+  bool screen_capturer_is_started_ = false;
+  bool start_keyboard_capturer_ = false;
+  bool keyboard_capturer_is_started_ = false;
+  bool keyboard_capturer_uses_window_events_ = false;
+  bool focus_on_stream_window_ = false;
+  bool audio_capture_ = false;
+  int screen_width_ = 1280;
+  int screen_height_ = 720;
+  std::atomic<int> selected_display_{0};
+  char remote_id_display_[12] = "";
+  unsigned char audio_buffer_[720]{};
+  int audio_len_ = 0;
+  bool audio_buffer_fresh_ = false;
+  bool need_to_rejoin_ = false;
+  std::chrono::steady_clock::time_point last_rejoin_check_time_ =
+      std::chrono::steady_clock::now();
+  std::string controlled_remote_id_;
+  std::string connection_dialog_target_;
+  std::string remote_client_id_;
+};
+
+struct UpdateState {
+  bool update_available_ = false;
+  std::string latest_version_;
+  std::string release_name_;
+  std::string release_notes_;
+  std::string release_date_;
+};
+
+struct UiState {
+  bool rejoin_ = false;
+  bool show_password_ = true;
+  bool show_connection_status_window_ = false;
+  bool is_client_mode_ = false;
+  std::atomic<bool> is_server_mode_{false};
+  std::atomic<bool> incoming_controllers_changed_{false};
+  bool reload_recent_connections_ = true;
+  bool show_offline_warning_window_ = false;
+  std::string offline_warning_text_;
+  bool re_enter_remote_id_ = false;
+};
+
+struct ApplicationState : MainWindowState,
+                          InteractionState,
+                          UpdateState,
+                          UiState {};
+
+}  // namespace crossdesk::gui_detail
+
+#endif

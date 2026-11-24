@@ -1,0 +1,266 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2026-09-01
+ * Copyright (c) 2026 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _REMOTE_ACTION_H_
+#define _REMOTE_ACTION_H_
+
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <remote_cursor_shape.h>
+#include <display_resolution.h>
+
+namespace crossdesk {
+
+enum ControlType {
+  invalid = -1,
+  mouse = 0,
+  keyboard = 1,
+  audio_capture = 2,
+  host_infomation = 3,
+  display_id = 4,
+  service_status = 5,
+  service_command = 6,
+  keyboard_state = 7,
+  cursor_state = 8,
+  privacy_command = 9,
+  privacy_status = 10,
+  video_settings = 11,
+  video_settings_status = 12,
+  text_input = 13,
+  video_codec_status = 14,
+  display_resolution = 15,
+  display_resolution_status = 16,
+};
+
+enum MouseFlag {
+  move = 0,
+  left_down,
+  left_up,
+  right_down,
+  right_up,
+  middle_down,
+  middle_up,
+  wheel_vertical,
+  wheel_horizontal,
+};
+
+enum KeyFlag { key_down = 0, key_up };
+enum ServiceCommandFlag { send_sas = 0, lock_workstation };
+
+struct Mouse {
+  float x;
+  float y;
+  int s;
+  MouseFlag flag;
+};
+
+struct Key {
+  std::size_t key_value;
+  uint32_t scan_code;
+  bool extended;
+  KeyFlag flag;
+};
+
+inline constexpr std::size_t kMaxKeyboardStateKeys = 32;
+
+struct KeyboardStateKey {
+  std::size_t key_value;
+  uint32_t scan_code;
+  bool extended;
+};
+
+struct KeyboardState {
+  uint32_t seq;
+  std::size_t pressed_count;
+  KeyboardStateKey pressed_keys[kMaxKeyboardStateKeys];
+};
+
+// Optional presentation metadata. Zero preserves pre-metadata peers' behavior.
+enum class CursorRenderMode : uint8_t {
+  legacy = 0,
+  separate,
+  embedded,
+  hidden,
+  unknown,
+};
+
+enum class CursorHiddenReason : uint8_t {
+  unspecified = 0,
+  system_hidden,
+  system_suppressed,
+  no_pointing_device,
+  sampling_failed,
+  secure_desktop_pending,
+};
+
+struct CursorState {
+  uint32_t seq;
+  bool visible;
+  RemoteCursorShape shape;
+  bool position_valid;
+  float x;
+  float y;
+  // Normalized displacement from the input hotspot to the visible cursor
+  // anchor. This is presentation metadata and must not affect input mapping.
+  float visual_offset_x;
+  float visual_offset_y;
+  int display_id;
+  // Whether receivers should apply the position fields in this message.
+  // Shape-only updates set this to false so cursor appearance can remain
+  // responsive while position feedback to the input source is suppressed.
+  bool position_update;
+  // Keep visible/shape for old receivers; new receivers can distinguish an
+  // embedded pointer from a hidden pointer and an unavailable sample.
+  CursorRenderMode render_mode;
+  CursorHiddenReason hidden_reason;
+};
+
+enum class HostPlatform { Unknown, Windows, MacOS, Linux, IOS, Android, HarmonyOS };
+
+const char* HostPlatformName(HostPlatform platform);
+HostPlatform ParseHostPlatform(const std::string& platform);
+
+struct HostInfo {
+  char host_name[64];
+  std::size_t host_name_size;
+  // Optional; an empty string means the peer version is unknown.
+  char app_version[64];
+  // Optional on the wire; missing or unrecognized values are unknown.
+  HostPlatform platform;
+  char** display_list;
+  std::size_t display_num;
+  int* left;
+  int* top;
+  int* right;
+  int* bottom;
+  // Optional capability; absent in legacy desktop and web host information.
+  bool supports_privacy_screen;
+  bool supports_video_settings;
+  bool supports_video_codec_status;
+  bool supports_text_input;
+  bool supports_deskhub_preview;
+  bool supports_deskhub_resolution;
+  bool supports_deskhub_fps15;
+  bool supports_deskhub_bandwidth;
+  // Optional; legacy peers keep the original single-file transfer UI.
+  bool supports_file_browser;
+  bool supports_file_clipboard;
+  int file_clipboard_version;
+};
+
+struct ServiceStatus {
+  bool available;
+  char interactive_stage[32];
+};
+
+struct ServiceCommand {
+  ServiceCommandFlag flag;
+};
+
+enum class PrivacyState { unsupported, off, starting, on, stopping, failed };
+enum class PrivacyCommandFlag { query, enable, disable, lock };
+struct PrivacyCommand {
+  PrivacyCommandFlag flag;
+  bool block_local_input;
+};
+struct PrivacyStatus {
+  PrivacyState state;
+  bool supported;
+  bool input_block_supported;
+  bool overlay_active;
+  bool input_blocked;
+  bool remote_paused;
+  uint32_t revision;
+  char reason[256];
+  // Monotonic event counter retained across status heartbeats and recovery.
+  uint32_t local_unlock_revision;
+};
+
+struct VideoSettings {
+  int quality;     // 0: low, 1: medium, 2: high
+  int frame_rate;  // 30 or 60
+  int preference;  // 0: frame rate, 1: quality, 2: balanced
+  uint32_t request_id;
+  bool accepted;  // Only meaningful in video_settings_status.
+};
+
+struct VideoCodecStatus {
+  char encoder[128];
+};
+
+inline bool ValidVideoSettings(const VideoSettings& settings) {
+  return settings.quality >= 0 && settings.quality <= 2 &&
+         (settings.frame_rate == 30 || settings.frame_rate == 60) &&
+         settings.preference >= 0 && settings.preference <= 2;
+}
+
+inline constexpr std::size_t kMaxTextInputBytes = 16 * 1024;
+
+struct RemoteAction {
+  ControlType type = ControlType::invalid;
+  union {
+    Mouse m;
+    Key k;
+    KeyboardState ks;
+    CursorState cs;
+    HostInfo i;
+    bool a;
+    int d;
+    ServiceStatus ss;
+    ServiceCommand c;
+    PrivacyCommand pc;
+    PrivacyStatus ps;
+    VideoSettings vs;
+    VideoCodecStatus vcs;
+  };
+
+  // Committed UTF-8 text. Kept outside the POD union for automatic ownership.
+  std::string text;
+  // Optional host information extension, also returned with resolution status.
+  std::vector<DisplayResolutionInfo> display_resolutions;
+  DisplayResolutionChange resolution_change;
+  // Controller preferences sent with its initial host information.
+  std::vector<DisplayResolutionPreference> preferred_display_resolutions;
+
+  std::string to_json() const;
+  bool from_json(const std::string& json_string);
+
+  static std::string ToJson(const RemoteAction& action);
+  static bool FromJson(const std::string& json_string, RemoteAction& output);
+};
+
+// Releases the dynamically allocated display arrays held by host information.
+// Other RemoteAction variants require no explicit cleanup and are left unchanged.
+void FreeRemoteAction(RemoteAction& action);
+
+// One display as advertised in host information; bounds are virtual-desktop
+// pixel coordinates.
+struct HostDisplay {
+  std::string name;
+  int left = 0;
+  int top = 0;
+  int right = 0;
+  int bottom = 0;
+};
+
+// Builds the host_infomation message advertised on every new connection.
+// |host_name| is UTF-8 and truncated at a character boundary to fit the wire
+// field size. The display arrays are heap-allocated with the same layout the
+// decoder produces; release the result with FreeRemoteAction. An allocation
+// failure yields an empty display list rather than a partially filled one.
+// Missing or oversized app versions are advertised as unknown (empty).
+RemoteAction MakeHostInformation(const std::string& host_name,
+                                 const std::vector<HostDisplay>& displays,
+                                 bool supports_privacy_screen,
+                                 const std::string& app_version = {},
+                                 HostPlatform platform = HostPlatform::Unknown);
+
+}  // namespace crossdesk
+
+#endif

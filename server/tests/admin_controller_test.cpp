@@ -1,0 +1,506 @@
+#include "admin_controller.h"
+
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "admin_auth.h"
+#include "device_db_manager.h"
+#include "presence_manager.h"
+#include "transmission_manager.h"
+
+int main() {
+  int failures = 0;
+
+  auto expect = [&failures](bool condition, const std::string& message) {
+    if (!condition) {
+      std::cerr << "FAIL: " << message << std::endl;
+      ++failures;
+    }
+  };
+  auto contains_id = [](const std::vector<std::string>& ids,
+                        const std::string& id) {
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+  };
+
+  expect(AdminController::IsAdminRoute("/admin"), "/admin is admin route");
+  expect(!AdminController::IsAdminRoute("/admin/unknown"),
+         "unknown admin pages are not frontend routes");
+  expect(!AdminController::IsAdminRoute("/administrator"),
+         "similar path prefixes are not admin routes");
+  expect(AdminController::IsAdminRoute("/admin/assets/admin.js"),
+         "/admin/assets/admin.js is admin route");
+  expect(AdminController::IsAdminRoute("/api/admin/overview"),
+         "/api/admin/overview is admin route");
+  expect(AdminController::IsAdminRoute("/api/admin/overview?session_limit=1"),
+         "/api/admin/overview with query is admin route");
+  expect(!AdminController::IsAdminRoute("/api/stats"),
+         "/api/stats is not admin route");
+  expect(!AdminController::IsAdminRoute("/api/adminx"),
+         "/api/adminx is not admin route");
+
+  expect(AdminController::ExtractDisconnectTransmissionId(
+             "/api/admin/sessions/100284391/disconnect") == "100284391",
+         "disconnect route extracts transmission id");
+  expect(AdminController::ExtractDisconnectTransmissionId(
+             "/api/admin/sessions/100284391/disconnect?x=1") == "100284391",
+         "disconnect route extracts transmission id with query");
+  expect(AdminController::ExtractDisconnectTransmissionId(
+             "/api/admin/sessions/100284391") == "",
+         "non-disconnect route does not extract id");
+
+  auto transmission = std::make_shared<TransmissionManager>();
+  AdminAuth disabled("", "", std::chrono::seconds(60));
+  AdminController disabled_controller(
+      &disabled, nullptr, transmission, nullptr,
+      [](const std::string&, nlohmann::json) {});
+
+  AdminHttpResponse disabled_response = disabled_controller.Handle(
+      {"GET", "/api/admin/overview", "", ""});
+  expect(disabled_response.status == 503,
+         "disabled admin API returns service unavailable");
+  expect(disabled_response.body.find("admin_disabled") != std::string::npos,
+         "disabled admin API returns admin_disabled error");
+
+  AdminAuth auth("admin", "secret", std::chrono::seconds(60));
+  AdminController controller(&auth, nullptr, transmission, nullptr,
+                             [](const std::string&, nlohmann::json) {});
+  AdminHttpResponse admin_page =
+      controller.Handle({"GET", "/admin", "", ""});
+  expect(admin_page.status == 200, "admin page returns static frontend");
+  expect(admin_page.body.find("/admin/assets/admin.js") != std::string::npos,
+         "admin page references separated frontend script");
+  for (const std::string page : {"/admin/", "/admin/overview", "/admin/data",
+                                 "/admin/about"}) {
+    for (const std::string suffix : {"", "?source=bookmark", "/"}) {
+      if (page == "/admin/" && suffix == "/") continue;
+      const std::string resource = page + suffix;
+      expect(AdminController::IsAdminRoute(resource),
+             resource + " is a directly accessible admin page");
+      const auto response = controller.Handle({"GET", resource, "", ""});
+      expect(response.status == 200 &&
+                 response.content_type.find("text/html") != std::string::npos &&
+                 response.body == admin_page.body,
+             resource + " serves the admin frontend for direct loads and reloads");
+      const auto disabled_page =
+          disabled_controller.Handle({"GET", resource, "", ""});
+      expect(disabled_page.status == 200 &&
+                 disabled_page.body.find("not enabled") != std::string::npos,
+             resource + " respects disabled admin configuration");
+    }
+  }
+  AdminHttpResponse admin_script =
+      controller.Handle({"GET", "/admin/assets/admin.js", "", ""});
+  expect(admin_script.status == 200, "admin script asset returns ok");
+  expect(admin_script.content_type.find("javascript") != std::string::npos,
+         "admin script asset uses javascript content type");
+  AdminHttpResponse unauthorized =
+      controller.Handle({"GET", "/api/admin/overview", "", ""});
+  expect(unauthorized.status == 401,
+         "protected admin API requires session");
+  expect(unauthorized.body.find("unauthorized") != std::string::npos,
+         "protected admin API returns unauthorized error");
+
+  AdminHttpResponse login = controller.Handle(
+      {"POST", "/api/admin/login",
+       R"({"username":"admin","password":"secret"})", ""});
+  expect(login.status == 200, "valid login returns ok");
+  bool has_cookie = false;
+  for (const auto& header : login.headers) {
+    if (header.first == "Set-Cookie" &&
+        header.second.find("cd_admin_session=") != std::string::npos) {
+      has_cookie = true;
+    }
+  }
+  expect(has_cookie, "valid login sets session cookie");
+
+  AdminHttpResponse bad_login = controller.Handle(
+      {"POST", "/api/admin/login",
+       R"({"username":"admin","password":"wrong"})", ""});
+  expect(bad_login.status == 401, "invalid login returns unauthorized");
+
+  transmission->BindHostToTransmission("host-1", "host-1");
+  transmission->BindGuestToTransmission("guest-1", "host-1");
+  auto token = auth.Login("admin", "secret");
+  AdminHttpResponse overview = controller.Handle(
+      {"GET",
+       "/api/admin/overview?session_limit=1&session_offset=0&session_search=guest-1",
+       "", "cd_admin_session=" + *token});
+  expect(overview.status == 200, "overview with pagination returns ok");
+  auto overview_body = nlohmann::json::parse(overview.body);
+  expect(overview_body["sessions"].size() == 1,
+         "overview applies session pagination");
+  expect(overview_body["sessions_page"]["total"] == 1,
+         "overview reports filtered session total");
+  AdminHttpResponse stats = controller.Handle(
+      {"GET", "/api/admin/stats", "", "cd_admin_session=" + *token});
+  expect(stats.status == 200, "stats returns ok");
+  auto stats_body = nlohmann::json::parse(stats.body);
+  expect(stats_body["stats"]["active_connection_count"] == 1,
+         "stats reports active connection count");
+  expect(stats_body["stats"]["online_duration_seconds"] == 0,
+         "stats reports online duration without database");
+
+  const auto db_path =
+      std::filesystem::temp_directory_path() /
+      ("crossdesk_admin_controller_test_" +
+       std::to_string(std::chrono::steady_clock::now()
+                          .time_since_epoch()
+                          .count()) +
+       ".db");
+  {
+    DeviceDBManager db(db_path.string());
+    for (DeviceDBManager* session_db : {static_cast<DeviceDBManager*>(nullptr),
+                                       &db}) {
+      auto session_transmission = std::make_shared<TransmissionManager>(false);
+      session_transmission->BindHostToTransmission("host-0", "tx-0");
+      session_transmission->BindHostToTransmission("host-1", "tx-1");
+      session_transmission->BindHostToTransmission("host-2", "tx-2");
+      session_transmission->BindHostToTransmission("host-3", "tx-3");
+      AdminController session_controller(
+          &auth, nullptr, session_transmission, session_db,
+          [](const std::string&, nlohmann::json) {});
+      auto session_overview = [&](const std::string& query) {
+        return nlohmann::json::parse(session_controller.Handle(
+            {"GET", "/api/admin/overview" + query, "",
+             "cd_admin_session=" + *token}).body);
+      };
+
+      auto idle = session_overview("");
+      expect(idle["stats"]["active_connection_count"] == 0 &&
+                 idle["sessions"].empty() && idle["sessions_page"]["total"] == 0,
+             "idle hosts do not appear as active sessions with or without a database");
+
+      session_transmission->BindGuestToTransmission("guest-1", "tx-1");
+      session_transmission->BindGuestToTransmission("guest-3", "tx-3");
+      auto page = session_overview("?session_limit=1&session_offset=1");
+      expect(page["stats"]["active_connection_count"] == 2 &&
+                 page["sessions_page"]["total"] == 2 &&
+                 page["sessions"].size() == 1 &&
+                 page["sessions"][0]["transmission_id"] == "tx-3" &&
+                 page["sessions"][0]["participant_count"] == 2,
+             "active session filtering happens before pagination and counting");
+      auto idle_search = session_overview("?session_search=host-0");
+      expect(idle_search["sessions"].empty() &&
+                 idle_search["sessions_page"]["total"] == 0,
+             "searching for an idle host does not return an active session");
+      auto guest_search = session_overview("?session_search=guest-1");
+      expect(guest_search["sessions_page"]["total"] == 1 &&
+                 guest_search["sessions"].size() == 1 &&
+                 guest_search["sessions"][0]["transmission_id"] == "tx-1",
+             "active session search still matches controllers");
+
+      session_transmission->ReleaseGuestFromTransmission("guest-1");
+      auto remaining = session_overview("");
+      expect(remaining["stats"]["active_connection_count"] == 1 &&
+                 remaining["sessions_page"]["total"] == 1 &&
+                 remaining["sessions"].size() == 1 &&
+                 remaining["sessions"][0]["transmission_id"] == "tx-3",
+             "a session disappears from the active list when its controller leaves");
+      session_transmission->ReleaseGuestFromTransmission("guest-3");
+      auto ended = session_overview("");
+      expect(ended["stats"]["active_connection_count"] == 0 &&
+                 ended["sessions"].empty() && ended["sessions_page"]["total"] == 0,
+             "ending all control connections leaves an empty active session list");
+      expect(session_transmission->IsTransmissionExist("tx-1") &&
+                 session_transmission->IsTransmissionExist("tx-3"),
+             "listing active sessions preserves hosts waiting for new connections");
+    }
+
+    PresenceManager presence;
+    presence.SetDeviceDB(&db);
+    websocketpp::connection_hdl hdl;
+    presence.OnLogin("device-admin-1", "device-admin-1", hdl);
+    presence.OnLogin("device-admin-2", "device-admin-2", hdl);
+    presence.OnLogin("device-admin-offline", "device-admin-offline", hdl);
+    presence.OnLogout("device-admin-offline");
+    presence.OnLogin("device-admin-control", "device-admin-control", hdl);
+    presence.OnLogin("web-admin-1", "web-admin-1", hdl);
+    db.UpdateDeviceClientInfo("device-admin-1", "1.2.3", "windows");
+    db.UpdateDeviceClientInfo("device-admin-2", "1.10.0", "macos");
+    db.UpdateDeviceClientInfo("device-admin-offline", "1.2.3", "windows");
+    db.UpdateDeviceClientInfo("device-admin-control", "1.2.3", "linux");
+    db.UpdateDeviceClientInfo("web-admin-1", "3.0.0", "web");
+    db.StartRemoteControlSession("tx-admin", "device-admin-1",
+                                 "device-admin-offline");
+    db.EndRemoteControlSession("tx-admin", "device-admin-1",
+                               "device-admin-offline");
+    db.StartRemoteControlSession("tx-admin-live", "device-admin-1",
+                                 "device-admin-offline");
+    db.StartRemoteControlSession("tx-admin-clone", "device-admin-1",
+                                 "C-device-admin-control");
+    AdminController db_controller(&auth, &presence, transmission, &db,
+                                  [](const std::string&, nlohmann::json) {});
+    AdminHttpResponse db_overview = db_controller.Handle(
+        {"GET", "/api/admin/overview?device_search=device-admin-1", "",
+         "cd_admin_session=" + *token});
+    expect(db_overview.status == 200,
+           "overview with device durations returns ok");
+    auto db_overview_body = nlohmann::json::parse(db_overview.body);
+    const auto public_stats = db_controller.GetPublicStats();
+    for (const auto& key : {"total_online_seconds", "total_control_seconds",
+                            "total_controlled_seconds"}) {
+      expect(!public_stats.contains(key) && !db_overview_body["stats"].contains(key),
+             "public stats and admin overview exclude cumulative durations");
+    }
+
+    expect(db_overview_body["devices"].size() == 1,
+           "overview defaults to filtered online devices");
+    expect(db_overview_body["devices"][0]["online_since"] > 0,
+           "overview reports device online_since");
+    expect(db_overview_body["devices"][0].contains("online_duration_seconds"),
+           "overview reports device online duration");
+    expect(!db_overview_body["devices"][0].contains("total_online_seconds"),
+           "overview excludes device total online duration");
+    expect(!db_overview_body["devices"][0].contains("total_control_seconds"),
+           "overview excludes device total control duration");
+    expect(!db_overview_body["devices"][0].contains("total_controlled_seconds"),
+           "overview excludes device total controlled duration");
+    expect(!db_overview_body["devices"][0].contains("client_ip"),
+           "overview excludes client IP for online devices");
+    expect(db_overview_body["devices"][0].contains("current_control_seconds"),
+           "overview reports device current control duration");
+    expect(db_overview_body["devices"][0].contains(
+               "current_controlled_seconds"),
+           "overview reports device current controlled duration");
+    expect(db_overview_body["stats"].contains("online_duration_seconds"),
+           "overview stats include online duration");
+    expect(!db_overview_body["stats"].contains("total_control_seconds"),
+           "overview stats exclude total control duration");
+    expect(!db_overview_body["stats"].contains("total_controlled_seconds"),
+           "overview stats exclude total controlled duration");
+    expect(db_overview_body["device_counts"]["all"] == 1,
+           "overview search scopes all device count");
+    expect(db_overview_body["device_counts"]["online"] == 1,
+           "overview reports online device count");
+    expect(db_overview_body["device_counts"]["offline"] == 0,
+           "overview search scopes offline count");
+    expect(db_overview_body["device_counts"]["active"] == 1,
+           "overview search scopes active count");
+    expect(db_overview_body["device_counts"]["web"] == 0,
+           "overview search scopes web count");
+    expect(db_overview_body["device_kind_counts"]["pc"] == 1,
+           "overview reports searched PC client kind count");
+    expect(db_overview_body["device_kind_counts"]["web"] == 0,
+           "overview reports searched web client kind count");
+    AdminHttpResponse offline_overview = db_controller.Handle(
+        {"GET",
+         "/api/admin/overview?device_filter=offline&device_search=device-admin-offline",
+         "",
+         "cd_admin_session=" + *token});
+    expect(offline_overview.status == 200,
+           "overview with offline device returns ok");
+    auto offline_body = nlohmann::json::parse(offline_overview.body);
+    expect(offline_body["devices"].size() == 1,
+           "overview keeps offline device in presence list");
+    expect(!offline_body["devices"][0]["online"].get<bool>(),
+           "overview reports offline status");
+    expect(offline_body["devices"][0]["last_online_at"] > 0,
+           "overview reports last online timestamp for offline device");
+    expect(offline_body["devices"][0]["online_duration_seconds"] == 0,
+           "overview reports zero current duration for offline device");
+    expect(!offline_body["devices"][0].contains("client_ip"),
+           "overview excludes client IP for offline devices");
+    expect(offline_body["devices"][0]["active_control_count"] == 1,
+           "overview preserves controller details outside the active filter");
+
+    AdminHttpResponse active_overview = db_controller.Handle(
+        {"GET",
+         "/api/admin/overview?device_filter=active&device_sort=device_id&device_order=asc",
+         "",
+         "cd_admin_session=" + *token});
+    expect(active_overview.status == 200,
+           "overview with active device filter returns ok");
+    auto active_body = nlohmann::json::parse(active_overview.body);
+    expect(active_body["devices_page"]["total"] == 1 &&
+               active_body["device_counts"]["active"] == 1,
+           "overview counts a shared controlled device once");
+    expect(active_body["devices"].size() == 1,
+           "overview returns only controlled devices");
+    expect(active_body["devices"][0]["id"] == "device-admin-1",
+           "overview active filter returns the host");
+    expect(active_body["devices"][0]["active_controlled_count"] == 2,
+           "overview reports active controlled count");
+    auto first_controlled_by =
+        active_body["devices"][0]["active_controlled_by"]
+            .get<std::vector<std::string>>();
+    expect(contains_id(first_controlled_by, "device-admin-offline") &&
+               contains_id(first_controlled_by, "device-admin-control"),
+           "overview reports active controlled-by peer ids");
+    AdminHttpResponse control_overview = db_controller.Handle(
+        {"GET",
+         "/api/admin/overview?device_filter=all&device_search=device-admin-control",
+         "",
+         "cd_admin_session=" + *token});
+    expect(control_overview.status == 200,
+           "overview with controller search returns ok");
+    auto control_body = nlohmann::json::parse(control_overview.body);
+    expect(control_body["device_counts"]["active"] == 0,
+           "overview excludes controllers from the controlled count");
+    expect(control_body["devices"].size() == 1 &&
+               control_body["devices"][0]["id"] == "device-admin-control" &&
+               control_body["devices"][0]["active_control_count"] == 1,
+           "overview maps clone guest control count to base device");
+    auto clone_targets = control_body["devices"][0]["active_control_targets"]
+                             .get<std::vector<std::string>>();
+    expect(contains_id(clone_targets, "device-admin-1"),
+           "overview maps clone guest control target to base device");
+
+    AdminHttpResponse active_control_overview = db_controller.Handle(
+        {"GET",
+         "/api/admin/overview?device_filter=active&device_search=device-admin-control",
+         "",
+         "cd_admin_session=" + *token});
+    expect(active_control_overview.status == 200,
+           "overview with active controller search returns ok");
+    auto active_control_body =
+        nlohmann::json::parse(active_control_overview.body);
+    expect(active_control_body["devices_page"]["total"] == 0 &&
+               active_control_body["device_counts"]["active"] == 0 &&
+               active_control_body["devices"].empty(),
+           "overview controlled filter excludes controllers from count and list");
+
+    AdminHttpResponse web_overview = db_controller.Handle(
+        {"GET", "/api/admin/overview?device_filter=web", "",
+         "cd_admin_session=" + *token});
+    expect(web_overview.status == 200,
+           "overview with web client filter returns ok");
+    auto web_body = nlohmann::json::parse(web_overview.body);
+    expect(web_body["devices"].size() == 1,
+           "overview returns web clients on web filter");
+    expect(web_body["devices"][0]["kind"] == "web",
+           "overview marks web client kind");
+    expect(!web_body["devices"][0].contains("client_ip"),
+           "overview excludes client IP for web clients");
+
+    AdminHttpResponse web_kind_overview = db_controller.Handle(
+        {"GET",
+         "/api/admin/overview?device_kind=web&device_filter=online",
+         "",
+         "cd_admin_session=" + *token});
+    expect(web_kind_overview.status == 200,
+           "overview with web client kind returns ok");
+    auto web_kind_body = nlohmann::json::parse(web_kind_overview.body);
+    expect(web_kind_body["devices_page"]["kind"] == "web",
+           "overview echoes normalized web client kind");
+    expect(web_kind_body["device_counts"]["online"] == 1,
+           "overview counts online web clients for selected kind");
+    expect(web_kind_body["device_kind_counts"]["pc"] == 4,
+           "overview reports PC client kind count");
+    expect(web_kind_body["device_kind_counts"]["web"] == 1,
+           "overview reports web client kind count");
+    expect(web_kind_body["devices"].size() == 1 &&
+               web_kind_body["devices"][0]["kind"] == "web",
+           "overview filters device list by web client kind");
+
+    auto client_filtered = nlohmann::json::parse(db_controller.Handle(
+        {"GET", "/api/admin/overview?device_filter=all&device_platform=windows"
+                "&device_version=1.2.3&device_sort=device_id&device_order=asc"
+                "&device_limit=1&device_offset=1", "",
+         "cd_admin_session=" + *token}).body);
+    expect(client_filtered["devices"].size() == 1 &&
+               client_filtered["devices"][0]["id"] == "device-admin-offline" &&
+               client_filtered["devices_page"]["total"] == 2,
+           "overview applies platform and version filters before pagination");
+    expect(client_filtered["devices_page"]["platform"] == "windows" &&
+               client_filtered["devices_page"]["version"] == "1.2.3",
+           "overview echoes client metadata filters");
+    expect(client_filtered["device_counts"]["all"] == 2 &&
+               client_filtered["device_counts"]["online"] == 1 &&
+               client_filtered["device_counts"]["offline"] == 1 &&
+               client_filtered["device_counts"]["active"] == 1 &&
+               client_filtered["device_kind_counts"]["pc"] == 2 &&
+               client_filtered["device_kind_counts"]["web"] == 0,
+           "overview counts agree with the selected platform and version");
+    expect(client_filtered["device_client_filters"]["platforms"] ==
+               nlohmann::json::array({"linux", "macos", "windows"}) &&
+               client_filtered["device_client_filters"]["versions"] ==
+               nlohmann::json::array({"1.10.0", "1.2.3"}),
+           "client filter options cover the category beyond the selected page and filters");
+    auto version_filtered = nlohmann::json::parse(db_controller.Handle(
+        {"GET", "/api/admin/overview?device_filter=all&device_version=1.2.3", "",
+         "cd_admin_session=" + *token}).body);
+    expect(version_filtered["devices"].size() == 3 &&
+               version_filtered["devices_page"]["total"] == 3,
+           "overview supports filtering by version across platforms");
+    auto search_filtered = nlohmann::json::parse(db_controller.Handle(
+        {"GET", "/api/admin/overview?device_platform=windows&device_version=1.2.3"
+                "&device_search=device-admin-1", "",
+         "cd_admin_session=" + *token}).body);
+    expect(search_filtered["devices"].size() == 1 &&
+               search_filtered["devices_page"]["total"] == 1 &&
+               search_filtered["device_counts"]["all"] == 1,
+           "overview combines client metadata with device ID search and online status");
+    auto no_clients = nlohmann::json::parse(db_controller.Handle(
+        {"GET", "/api/admin/overview?device_platform=windows&device_version=1.10.0",
+         "", "cd_admin_session=" + *token}).body);
+    expect(no_clients["devices"].empty() &&
+               no_clients["devices_page"]["total"] == 0 &&
+               no_clients["device_counts"]["all"] == 0 &&
+               no_clients["device_client_filters"] == client_filtered["device_client_filters"],
+           "empty filter combinations retain options for changing the selection");
+    expect(web_kind_body["device_client_filters"]["platforms"] ==
+               nlohmann::json::array({"web"}) &&
+               web_kind_body["device_client_filters"]["versions"] ==
+               nlohmann::json::array({"3.0.0"}),
+           "web client filter options do not include PC metadata");
+
+    auto restored_transmission = std::make_shared<TransmissionManager>();
+    AdminController restored_controller(
+        &auth, nullptr, restored_transmission, &db,
+        [](const std::string&, nlohmann::json) {});
+    AdminHttpResponse restored_stats = restored_controller.Handle(
+        {"GET", "/api/admin/stats", "", "cd_admin_session=" + *token});
+    expect(restored_stats.status == 200,
+           "restored stats with persisted sessions returns ok");
+    auto restored_stats_body = nlohmann::json::parse(restored_stats.body);
+    expect(restored_stats_body["stats"]["active_connection_count"] == 2,
+           "stats reports persisted active connection count");
+
+    AdminHttpResponse restored_sessions = restored_controller.Handle(
+        {"GET",
+         "/api/admin/overview?session_search=tx-admin-live&session_limit=10",
+         "",
+         "cd_admin_session=" + *token});
+    expect(restored_sessions.status == 200,
+           "overview lists persisted sessions without memory state");
+    auto restored_sessions_body =
+        nlohmann::json::parse(restored_sessions.body);
+    expect(restored_sessions_body["sessions_page"]["total"] == 1,
+           "overview reports persisted session total");
+    expect(restored_sessions_body["sessions"].size() == 1 &&
+               restored_sessions_body["sessions"][0]["transmission_id"] ==
+                   "tx-admin-live",
+           "overview returns persisted session row");
+
+    AdminHttpResponse restored_disconnect = restored_controller.Handle(
+        {"POST", "/api/admin/sessions/tx-admin-live/disconnect", "",
+         "cd_admin_session=" + *token});
+    expect(restored_disconnect.status == 200,
+           "disconnect clears persisted session without memory state");
+    expect(db.CountActiveRemoteControlConnections() == 1,
+           "disconnect removes persisted active connection");
+  }
+  std::filesystem::remove(db_path);
+
+  AdminHttpResponse disconnect = controller.Handle(
+      {"POST", "/api/admin/sessions/host-1/disconnect", "",
+       "cd_admin_session=" + *token});
+  expect(disconnect.status == 200, "disconnect returns ok");
+  expect(transmission->GetTransmissionSnapshots().empty(),
+         "disconnect releases transmission");
+
+  AdminHttpResponse already_closed = controller.Handle(
+      {"POST", "/api/admin/sessions/host-1/disconnect", "",
+       "cd_admin_session=" + *token});
+  expect(already_closed.status == 200,
+         "disconnect missing transmission is idempotent");
+  expect(already_closed.body.find("already_closed") != std::string::npos,
+         "idempotent disconnect reports already_closed");
+
+  return failures == 0 ? 0 : 1;
+}

@@ -1,0 +1,18 @@
+# Xmake cache
+.xmake/
+.xmake-toolchain-cache/
+build/
+apps/ios/Vendor/
+apps/ios/DerivedData*/
+apps/ios/.xmake/
+xcuserdata/
+*.xcuserstate
+
+# MacOS Cache
+.DS_Store
+
+# VSCode cache
+.vscode
+
+# CLI npm dependencies
+node_modules/

@@ -1,0 +1,401 @@
+#include "terminal_renderer.h"
+#include <algorithm>
+#include <charconv>
+namespace crossdesk::terminal {
+void Input::Tap(ControllerSession &s, int key, int modifier) {
+  if (modifier)
+    s.Key(modifier, true);
+  s.Key(key, true);
+  s.Key(key, false);
+  if (modifier)
+    s.Key(modifier, false);
+}
+bool Input::LocalKey(int key, ControllerSession &s, const Grid *grid) {
+  if (key == 29) {
+    if (command_mode) {
+      command_mode = false;
+      s.SetControl(control);
+      if (control)
+        Tap(s, 0xDD, 17); // VK_OEM_6: right bracket, not ASCII ']'.
+    } else {
+      command_mode = true;
+      // Release held buttons and suspend remote input while choosing a command.
+      s.SetControl(false);
+      mouse_buttons_ = 0;
+    }
+    return true;
+  }
+  if (control && !command_mode)
+    return false;
+  if (key == '?') {
+    command_mode = true;
+    s.SetControl(false);
+    mouse_buttons_ = 0;
+    return true;
+  }
+  if (command_mode && (key == 27 || key == 3)) {
+    command_mode = false;
+    s.SetControl(control);
+    return true;
+  }
+  if (key == 'q' || key == 3) {
+    exit = true;
+    command_mode = false;
+    control = false;
+  } else if (key == 'c') {
+    control = !control;
+  } else if (key == '+' || key == '=' || key == '-' || key == 'f' ||
+             key == 'i' || key == 'j' || key == 'k' || key == 'l') {
+    Navigate(char(key), grid);
+  } else if (!command_mode) {
+    return false;
+  } else {
+    error = "Unknown local command; ? for help";
+  }
+  s.SetControl(control && !command_mode);
+  if (!control || command_mode)
+    mouse_buttons_ = 0;
+  return true;
+}
+void Input::Zoom(double next_zoom, const Grid *grid) {
+  if (next_zoom == zoom)
+    return;
+  if (grid && mouse_column_ >= 0 && mouse_row_ >= 0) {
+    auto v = grid->viewport;
+    v.zoom = zoom;
+    v.native = native;
+    v.center_x = center_x;
+    v.center_y = center_y;
+    // Rebuild from the requested view so queued key/wheel repeats compose
+    // even when the terminal is still displaying an earlier frame.
+    const auto before = Layout(grid->source_width, grid->source_height, v);
+    if (const auto anchor = MapPointer(before, mouse_column_, mouse_row_)) {
+      v.zoom = next_zoom;
+      const auto after = Layout(grid->source_width, grid->source_height, v);
+      if (const auto moved = MapPointer(after, mouse_column_, mouse_row_)) {
+        const auto center = [](int origin, int size, unsigned extent,
+                               double shift) {
+          const double half = size * .5 / extent;
+          return std::clamp((origin + size * .5 + shift * (extent - 1)) /
+                                extent,
+                            half, 1 - half);
+        };
+        // Use the actual, clamped crop center and the same source-pixel
+        // mapping as remote input. Letterboxing and status rows stay aligned.
+        center_x = center(after.source.x, after.source.width,
+                          after.source_width,
+                          double(anchor->first) - moved->first);
+        center_y = center(after.source.y, after.source.height,
+                          after.source_height,
+                          double(anchor->second) - moved->second);
+      }
+    }
+  }
+  zoom = next_zoom;
+}
+void Input::Navigate(char key, const Grid *grid) {
+  if (key == '+' || key == '=')
+    Zoom(std::min(32.0, zoom * 2), grid);
+  if (key == '-')
+    Zoom(std::max(1.0, zoom / 2), grid);
+  if (key == 'f') {
+    native = false;
+    zoom = 1;
+    center_x = center_y = .5;
+  }
+  // Use the displayed crop as the pan step, including native pixel mode.
+  const double dx = grid && grid->source_width
+                        ? double(grid->source.width) / grid->source_width
+                        : 1 / zoom;
+  const double dy = grid && grid->source_height
+                        ? double(grid->source.height) / grid->source_height
+                        : 1 / zoom;
+  if (key == 'i' || key == 'j' || key == 'k' || key == 'l') {
+    center_x = std::clamp(center_x, dx / 2, 1 - dx / 2);
+    center_y = std::clamp(center_y, dy / 2, 1 - dy / 2);
+  }
+  if (key == 'j')
+    center_x -= .2 * dx;
+  if (key == 'l')
+    center_x += .2 * dx;
+  if (key == 'i')
+    center_y -= .2 * dy;
+  if (key == 'k')
+    center_y += .2 * dy;
+  center_x = std::clamp(center_x, 0.0, 1.0);
+  center_y = std::clamp(center_y, 0.0, 1.0);
+  ++view_revision;
+}
+void Input::Mouse(int b, int x, int y, bool release, ControllerSession &s,
+                  const Grid *grid) {
+  ++mouse_reports;
+  // Extra mouse buttons must not alias the three supported remote buttons.
+  if (b < 0 || b >= 128 || x <= 0 || y <= 0)
+    return;
+  // Track terminal coordinates even in local command mode. Re-map them for
+  // every zoom; a stationary mouse must follow subsequent view changes.
+  mouse_column_ = x - 1;
+  mouse_row_ = y - 1;
+  if (!grid || command_mode)
+    return;
+  auto pos = MapPointer(*grid, mouse_column_, mouse_row_);
+  if (!control) {
+    if (pos && !release) {
+      if (b & 64) {
+        Navigate((b & 1) ? '-' : '+', grid);
+      } else if (b == 0) {
+        center_x = pos->first;
+        center_y = pos->second;
+        native = true;
+        zoom = 1;
+        ++view_revision;
+      }
+    }
+    return;
+  }
+  if (!pos && !release)
+    return;
+  if (pos) {
+    pointer_x_ = pos->first;
+    pointer_y_ = pos->second;
+  }
+  const auto send = [&](int flag, int wheel = 0) {
+    if (s.Pointer(pointer_x_, pointer_y_, flag, wheel)) {
+      ++mouse_forwarded;
+      return true;
+    }
+    ++mouse_send_failures;
+    return false;
+  };
+  // Linux/X11 only positions the cursor on move events. A click or wheel
+  // report can arrive without prior motion, including over an SSH terminal.
+  // Always position before a button/scroll event; still release on failure.
+  if (pos && !send(0) && !release)
+    return;
+  if (b & 64) {
+    if (!release)
+      send((b & 2) ? 8 : 7, (b & 1) ? -120 : 120);
+    return;
+  }
+  if (b & 32)
+    return;
+  const int base = b & 3;
+  if (base == 3) {
+    // Legacy reports identify a release, but not which button was released.
+    if (release) {
+      for (unsigned i = 0; i < 3; ++i)
+        if ((mouse_buttons_ & (1u << i)) && send(2 + i * 2))
+          mouse_buttons_ &= ~(1u << i);
+    }
+    return;
+  }
+  const int index = base == 0 ? 0 : base == 1 ? 2 : 1;
+  if (send(1 + index * 2 + int(release))) {
+    if (release)
+      mouse_buttons_ &= ~(1u << index);
+    else
+      mouse_buttons_ |= 1u << index;
+  }
+}
+void Input::Feed(const std::string &bytes, ControllerSession &s,
+                 const Grid *grid) {
+  if (exit)
+    return;
+  if (pending_.size() + bytes.size() > 32768) {
+    pending_.clear();
+    pasting_ = false;
+    s.SetControl(false);
+    mouse_buttons_ = 0;
+    control = false;
+    return;
+  }
+  if (!bytes.empty()) {
+    last_input_ = std::chrono::steady_clock::now();
+    error.clear();
+  }
+  if (bytes.empty() && pending_ == "\033" &&
+      std::chrono::steady_clock::now() - last_input_ >
+          std::chrono::milliseconds(80)) {
+    if (!LocalKey(27, s, grid))
+      Tap(s, 27);
+    pending_.clear();
+    return;
+  }
+  pending_ += bytes;
+  while (!pending_.empty()) {
+    if (pasting_) {
+      auto end = pending_.find("\033[201~");
+      if (end == std::string::npos)
+        return; // bounded by 32 KiB; one UTF-8 transaction
+      // Drop local-mode paste without leaving the mode or running commands.
+      if (control && !command_mode && !s.Text(pending_.substr(0, end)))
+        error = "Remote UTF-8 text input unavailable";
+      pending_.erase(0, end + 6);
+      pasting_ = false;
+      continue;
+    }
+    unsigned char c = pending_[0];
+    if (c == 29) {
+      LocalKey(c, s, grid);
+      pending_.erase(0, 1);
+      continue;
+    }
+    if (c == 27) {
+      if (pending_.size() < 2)
+        return;
+      if (pending_.compare(0, 6, "\033[200~") == 0) {
+        pasting_ = true;
+        pending_.erase(0, 6);
+        continue;
+      }
+      if (pending_[1] == '_') {
+        auto end = pending_.find("\033\\", 2);
+        if (end == std::string::npos)
+          return;
+        if (auto ack = ParseKittyAck(pending_.substr(0, end + 2)))
+          kitty_ack = ack;
+        pending_.erase(0, end + 2);
+        continue;
+      }
+      if (pending_[1] == '[' || pending_[1] == 'O') {
+        if (pending_.compare(0, 3, "\033[M") == 0) {
+          // Normal (non-SGR) reports have three raw bytes after CSI M.
+          // Keep the whole packet buffered across reads so its coordinates
+          // cannot become keystrokes or local commands.
+          if (pending_.size() < 6)
+            return;
+          const int b = static_cast<unsigned char>(pending_[3]) - 32;
+          const int x = static_cast<unsigned char>(pending_[4]) - 32;
+          const int y = static_cast<unsigned char>(pending_[5]) - 32;
+          pending_.erase(0, 6);
+          if (b >= 0 && x > 0 && y > 0) {
+            ++mouse_legacy_reports;
+            const bool release = (b & 3) == 3 && !(b & (32 | 64));
+            Mouse(b, x, y, release, s, grid);
+          }
+          continue;
+        }
+        size_t end = 2;
+        while (end < pending_.size() &&
+               !(pending_[end] >= '@' && pending_[end] <= '~'))
+          ++end;
+        if (end == pending_.size())
+          return;
+        std::string seq = pending_.substr(0, end + 1);
+        pending_.erase(0, end + 1);
+        if (seq.back() == 't') {
+          terminal_metrics.Report(seq);
+          continue;
+        }
+        if (seq == "\033[O") {
+          control = false;
+          s.SetControl(false);
+          mouse_buttons_ = 0;
+          mouse_column_ = mouse_row_ = -1;
+          continue;
+        }
+        int key = 0;
+        if (seq == "\033[A" || seq == "\033OA")
+          key = 38;
+        else if (seq == "\033[B" || seq == "\033OB")
+          key = 40;
+        else if (seq == "\033[C" || seq == "\033OC")
+          key = 39;
+        else if (seq == "\033[D" || seq == "\033OD")
+          key = 37;
+        else if (seq == "\033[H")
+          key = 36;
+        else if (seq == "\033[F")
+          key = 35;
+        else if (seq == "\033[3~")
+          key = 46;
+        else if (seq == "\033[5~")
+          key = 33;
+        else if (seq == "\033[6~")
+          key = 34;
+        else if (seq == "\033OP")
+          key = 112;
+        else if (seq == "\033OQ")
+          key = 113;
+        else if (seq == "\033OR")
+          key = 114;
+        else if (seq == "\033OS")
+          key = 115;
+        if (key) {
+          if ((!control || command_mode) && key >= 37 && key <= 40) {
+            LocalKey(key == 37   ? 'j'
+                     : key == 38 ? 'i'
+                     : key == 39 ? 'l'
+                                 : 'k',
+                     s, grid);
+            continue;
+          }
+          if (command_mode)
+            LocalKey(0, s, grid);
+          else
+            Tap(s, key);
+          continue;
+        }
+        int b = 0, x = 0, y = 0;
+        char action = seq.back();
+        bool mouse =
+            seq.rfind("\033[<", 0) == 0 && (action == 'M' || action == 'm');
+        const char *cur = seq.data() + std::min(size_t(3), seq.size());
+        const char *limit = seq.data() + seq.size() - 1;
+        for (int *value : {&b, &x, &y}) {
+          if (!mouse)
+            break;
+          auto result = std::from_chars(cur, limit, *value);
+          mouse = result.ec == std::errc{} && *value >= 0 && *value <= 10000;
+          cur = result.ptr;
+          if (value != &y) {
+            mouse = mouse && cur < limit && *cur == ';';
+            if (mouse)
+              ++cur;
+          } else
+            mouse = mouse && cur == limit;
+        }
+        if (mouse)
+          Mouse(b, x, y, action == 'm', s, grid);
+        continue;
+      }
+      // Alt+ASCII letter: a tap with explicit modifier release.
+      if (command_mode)
+        LocalKey(0, s, grid);
+      else if (pending_[1] >= 'a' && pending_[1] <= 'z')
+        Tap(s, pending_[1] - 'a' + 'A', 18);
+      pending_.erase(0, 2);
+      continue;
+    }
+    if (c < 32 || c == 127) {
+      pending_.erase(0, 1);
+      if (LocalKey(c, s, grid)) {
+        if (exit)
+          return;
+      } else if (c == 13 || c == 10)
+        Tap(s, 13);
+      else if (c == 9)
+        Tap(s, 9);
+      else if (c == 127 || c == 8)
+        Tap(s, 8);
+      else if (c >= 1 && c <= 26)
+        Tap(s, 'A' + c - 1, 17);
+      continue;
+    }
+    size_t n = c < 128              ? 1
+               : (c & 0xe0) == 0xc0 ? 2
+               : (c & 0xf0) == 0xe0 ? 3
+               : (c & 0xf8) == 0xf0 ? 4
+                                    : 1;
+    if (pending_.size() < n)
+      return;
+    auto text = pending_.substr(0, n);
+    pending_.erase(0, n);
+    if (LocalKey(c, s, grid)) {
+      if (exit)
+        return;
+    } else if (control && !s.Text(text))
+      error = "Remote UTF-8 text input unavailable";
+  }
+}
+} // namespace crossdesk::terminal

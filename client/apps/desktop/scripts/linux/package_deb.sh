@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Keep readelf and ldd output stable for the runtime dependency checks below.
+export LC_ALL=C
+
+if [[ $# -lt 3 || $# -gt 4 ]]; then
+    echo "Usage: $0 <debian-arch> <xmake-arch> <version> [extra-recommendation]" >&2
+    exit 2
+fi
+
+DEBIAN_ARCH="$1"
+XMAKE_ARCH="$2"
+INPUT_VERSION="$3"
+EXTRA_RECOMMENDATION="${4:-}"
+
+PKG_NAME="crossdesk"
+VIRTUAL_PACKAGE_NAME="crossdesk-virtual-desktop-xfce"
+APP_NAME="CrossDesk"
+MAINTAINER="Junkun Di <junkun.di@hotmail.com>"
+DESCRIPTION="A simple cross-platform remote desktop client."
+ALSA_RUNTIME_DEP="libasound2 | libasound2t64"
+PORTAL_RUNTIME_RECOMMENDS="xdg-desktop-portal, xdg-desktop-portal-gtk | xdg-desktop-portal-kde | xdg-desktop-portal-wlr"
+TRAY_RUNTIME_RECOMMENDS="libayatana-appindicator3-1 | libappindicator3-1"
+# Only the virtual desktop package installs a desktop environment. Both packages
+# contain the same application, including headless support. Older Ubuntu releases ship
+# dbus-run-session in dbus; newer releases split it into dbus-daemon.
+HEADLESS_RUNTIME_DEPS="xvfb, xfce4, dbus-daemon | dbus"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+
+normalize_app_version() {
+    local input="$1"
+    local prefix=""
+    local body="$input"
+
+    if [[ "$body" == v* ]]; then
+        prefix="v"
+        body="${body#v}"
+    fi
+
+    if [[ "$body" =~ ^([0-9]+(\.[0-9]+){1,3})-([0-9]{8})-([0-9]+)$ ]]; then
+        echo "${prefix}${BASH_REMATCH[1]}-${BASH_REMATCH[4]}-${BASH_REMATCH[3]}"
+    else
+        echo "$input"
+    fi
+}
+
+APP_VERSION="$(normalize_app_version "$INPUT_VERSION")"
+DEB_VERSION="${APP_VERSION#v}"
+if [[ ! "$DEB_VERSION" =~ ^[0-9][0-9A-Za-z.+:~_-]*$ ]]; then
+    echo "Invalid Debian version: $DEB_VERSION" >&2
+    exit 2
+fi
+
+BUILD_BINARY="$PROJECT_ROOT/build/linux/$XMAKE_ARCH/release/crossdesk"
+if [[ ! -x "$BUILD_BINARY" ]]; then
+    echo "Missing release binary: $BUILD_BINARY" >&2
+    echo "Build it first with: xmake f -m release -y && xmake b -vy crossdesk" >&2
+    exit 1
+fi
+
+for command_name in readelf ldd dpkg-deb strip; do
+    if ! command -v "$command_name" >/dev/null 2>&1; then
+        echo "Required packaging command is missing: $command_name" >&2
+        exit 1
+    fi
+done
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/crossdesk-deb.XXXXXX")"
+trap 'rm -rf "$WORK_DIR"' EXIT
+
+DEB_DIR="$WORK_DIR/${PKG_NAME}-${DEB_VERSION}"
+DEBIAN_DIR="$DEB_DIR/DEBIAN"
+BIN_DIR="$DEB_DIR/usr/bin"
+PRIVATE_DIR="$DEB_DIR/usr/lib/$PKG_NAME"
+ICON_BASE_DIR="$DEB_DIR/usr/share/icons/hicolor"
+DESKTOP_DIR="$DEB_DIR/usr/share/applications"
+
+install -d "$DEBIAN_DIR" "$BIN_DIR" "$PRIVATE_DIR" "$DESKTOP_DIR"
+install -m 0755 "$BUILD_BINARY" "$PRIVATE_DIR/crossdesk-bin"
+install -m 0755 "$(dirname "$BUILD_BINARY")/crossdesk_updater" "$PRIVATE_DIR/crossdesk_updater"
+
+# PipeWire is deliberately optional. The Wayland capturer resolves PipeWire
+# 0.3 with dlopen() so the same package can run on Ubuntu 20.04 without the
+# runtime while using the host runtime on newer Ubuntu releases.
+if readelf -d "$BUILD_BINARY" \
+    | grep -qE 'Shared library: \[libpipewire-0\.3\.so'; then
+    echo "CrossDesk must not link directly to the optional PipeWire runtime" >&2
+    exit 1
+fi
+
+# Resolve FUSE dynamically so either runtime can satisfy the package dependency.
+# A direct link would force one ABI even when the other is already installed.
+if readelf -d "$BUILD_BINARY" \
+    | grep -E 'Shared library: \[libfuse' >/dev/null; then
+    echo "CrossDesk must load FUSE 2 or 3 dynamically, not link to one ABI" >&2
+    exit 1
+fi
+
+# Slint is intentionally built as a shared library. Keep that runtime private
+# to CrossDesk instead of relying on a non-existent distribution package.
+SLINT_NEEDED="$(readelf -d "$BUILD_BINARY" | sed -n \
+    's/.*Shared library: \[\(libslint_cpp[^]]*\)\].*/\1/p' | head -n 1)"
+if [[ -n "$SLINT_NEEDED" ]]; then
+    # The build rule copies the exact linked package beside the executable.
+    # Never search global caches or trust the packager's LD_LIBRARY_PATH: an
+    # unpatched runtime can share both the version and SONAME of the linked one.
+    SLINT_LIBRARY="$(dirname "$BUILD_BINARY")/$SLINT_NEEDED"
+    if [[ ! -f "$SLINT_LIBRARY" ]]; then
+        echo "Missing build-matched Slint runtime: $SLINT_LIBRARY" >&2
+        echo "Build it first with: xmake b -vy crossdesk" >&2
+        exit 1
+    fi
+    install -m 0755 "$SLINT_LIBRARY" "$PRIVATE_DIR/$SLINT_NEEDED"
+    # Keep dynamic exports/relocations while removing unneeded symbols from the
+    # staged copy. Never strip Xmake's cached runtime in place.
+    strip --strip-unneeded "$PRIVATE_DIR/$SLINT_NEEDED"
+fi
+
+# Check the staged files with only their private runtime directory available.
+# ldd -r can exit successfully even when it reports unresolved symbols, so its
+# diagnostics must also be checked. This does not start the GUI or updater.
+for executable in crossdesk-bin crossdesk_updater; do
+    dependency_report="$WORK_DIR/$executable.ldd"
+    if ! env -u LD_PRELOAD -u LD_AUDIT LD_LIBRARY_PATH="$PRIVATE_DIR" \
+        ldd -r "$PRIVATE_DIR/$executable" > "$dependency_report" 2>&1 || \
+        grep -Eq 'not found|undefined symbol:' "$dependency_report"; then
+        echo "Packaged runtime dependency check failed: $executable" >&2
+        cat "$dependency_report" >&2
+        exit 1
+    fi
+done
+if [[ -n "$SLINT_NEEDED" ]]; then
+    if ! grep -Fq "$SLINT_NEEDED => $PRIVATE_DIR/$SLINT_NEEDED (" "$WORK_DIR/crossdesk-bin.ldd"; then
+        echo "Packaged executable does not load its private Slint runtime" >&2
+        cat "$WORK_DIR/crossdesk-bin.ldd" >&2
+        exit 1
+    fi
+fi
+
+cat > "$BIN_DIR/$PKG_NAME" <<'EOF'
+#!/bin/sh
+private_lib_dir="/usr/lib/crossdesk"
+if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    export LD_LIBRARY_PATH="$private_lib_dir:$LD_LIBRARY_PATH"
+else
+    export LD_LIBRARY_PATH="$private_lib_dir"
+fi
+exec /usr/lib/crossdesk/crossdesk-bin "$@"
+EOF
+chmod 0755 "$BIN_DIR/$PKG_NAME"
+ln -s "$PKG_NAME" "$BIN_DIR/$APP_NAME"
+
+for size in 16 24 32 48 64 96 128 256; do
+    install -d "$ICON_BASE_DIR/${size}x${size}/apps"
+    install -m 0644 "$PROJECT_ROOT/apps/desktop/resources/linux/crossdesk_${size}x${size}.png" \
+        "$ICON_BASE_DIR/${size}x${size}/apps/${PKG_NAME}.png"
+done
+
+RECOMMENDS="$PORTAL_RUNTIME_RECOMMENDS, $TRAY_RUNTIME_RECOMMENDS, policykit-1"
+if [[ -n "$EXTRA_RECOMMENDATION" ]]; then
+    RECOMMENDS="$RECOMMENDS, $EXTRA_RECOMMENDATION"
+fi
+
+cat > "$DESKTOP_DIR/$PKG_NAME.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Comment=$DESCRIPTION
+Exec=/usr/bin/$PKG_NAME
+Icon=$PKG_NAME
+StartupWMClass=$PKG_NAME
+Terminal=false
+Type=Application
+Categories=Utility;
+EOF
+
+# Give shells a desktop entry for the remote window's separate app id. Without
+# it, some shells fall back to the process's main launcher and merge the groups;
+# Wayland also uses this entry to resolve the icon. Hide it from app menus: a
+# fresh launch can open CrossDesk, but cannot recreate a live remote session.
+cat > "$DESKTOP_DIR/$PKG_NAME-remote-control.desktop" <<EOF
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME Remote Control
+Comment=Active CrossDesk remote control sessions
+Exec=/usr/bin/$PKG_NAME
+Icon=$PKG_NAME
+StartupWMClass=$PKG_NAME-remote-control
+Terminal=false
+Type=Application
+NoDisplay=true
+EOF
+
+# Stage and strip the application once, then package it with two dependency sets.
+# Keep the executable, launcher and configuration paths identical when switching.
+for package_name in "$PKG_NAME" "$VIRTUAL_PACKAGE_NAME"; do
+    extra_depends=""
+    description="$DESCRIPTION"
+    other_package="$VIRTUAL_PACKAGE_NAME"
+    if [[ "$package_name" == "$VIRTUAL_PACKAGE_NAME" ]]; then
+        extra_depends=", $HEADLESS_RUNTIME_DEPS"
+        description="CrossDesk with Xfce and Xvfb for independent virtual desktops."
+        other_package="$PKG_NAME"
+    fi
+    cat > "$DEBIAN_DIR/control" <<EOF
+Package: $package_name
+Version: $DEB_VERSION
+Architecture: $DEBIAN_ARCH
+Maintainer: $MAINTAINER
+Description: $description
+Depends: libc6 (>= 2.31), libstdc++6 (>= 10), libx11-6, libxext6,
+ libxrender1, libxft2, libxrandr2, libxfixes3, libxcursor1, libxi6, libxcb1, libxcb-randr0,
+ libxcb-xtest0, libxcb-xinerama0, libxcb-shape0, libxcb-xkb1,
+ libxcb-xfixes0, libxv1, libxtst6, $ALSA_RUNTIME_DEP, libsndio7.0,
+ libxcb-shm0, libpulse0, libdrm2, libdbus-1-3, libgl1,
+ fuse3 (>= 3.2) | fuse (>= 2.9)$extra_depends
+Recommends: $RECOMMENDS
+Conflicts: $other_package
+Replaces: $other_package
+Priority: optional
+Section: utils
+EOF
+    if [[ "$package_name" == "$VIRTUAL_PACKAGE_NAME" ]]; then
+        echo "Provides: $PKG_NAME (= $DEB_VERSION)" >> "$DEBIAN_DIR/control"
+    fi
+    # Read beside the executable by the updater; never store this in user config.
+    echo "$package_name" > "$PRIVATE_DIR/package-name"
+    chmod 0644 "$PRIVATE_DIR/package-name"
+    OUTPUT_FILE="$PROJECT_ROOT/${package_name}-linux-${DEBIAN_ARCH}-${APP_VERSION}.deb"
+    rm -f "$OUTPUT_FILE"
+    dpkg-deb --root-owner-group --build "$DEB_DIR" "$OUTPUT_FILE"
+    dpkg-deb --info "$OUTPUT_FILE" >/dev/null
+    dpkg-deb --contents "$OUTPUT_FILE" > "$WORK_DIR/package-contents.txt"
+
+    if [[ -n "$SLINT_NEEDED" ]] && \
+       ! grep -q "usr/lib/$PKG_NAME/$SLINT_NEEDED" "$WORK_DIR/package-contents.txt"; then
+        echo "Packaged artifact is missing $SLINT_NEEDED" >&2
+        exit 1
+    fi
+
+    echo "Deb package created: $OUTPUT_FILE"
+done

@@ -1,0 +1,62 @@
+import { FlatSurface, UiSurface } from "ui_surface.slint";
+import { LineEdit } from "std-widgets.slint";
+import { UiRadius } from "ui_radius.slint";
+import { ControlStyle } from "common.slint";
+
+// Retain the standard editor's selection, clipboard, clear button and input
+// method support. Its frame receives the shared field tint and rounded shape.
+export component RoundedLineEdit inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder-text;
+    in property <InputType> input-type: InputType.text;
+    in property <bool> enabled: true;
+    in property <length> font-size: 12px;
+    in property <color> normal-outline-color: UiSurface.edge;
+    in property <float> tint-opacity: 1;
+    in property <brush> surrounding-background: white;
+    callback accepted();
+    callback edited();
+    height: 30px;
+    border-radius: UiRadius.control;
+    background: white;
+    clip: true;
+    forward-focus: editor;
+
+    editor := LineEdit {
+        x: -2px; y: -2px;
+        width: parent.width + 4px; height: parent.height + 4px;
+        text <=> root.text;
+        placeholder-text: root.placeholder-text;
+        input-type: root.input-type;
+        enabled: root.enabled;
+        font-size: root.font-size;
+        accepted => { root.accepted(); }
+        edited => { root.edited(); }
+    }
+    // Fluent's LineEdit paints its own background and exposes no fill override.
+    // A visual-only tint preserves the standard editor and its built-in actions.
+    Rectangle {
+        width: parent.width; height: parent.height;
+        opacity: root.tint-opacity;
+        background: !root.enabled ? transparent
+            : editor.has-focus ? ControlStyle.input-focus-tint : ControlStyle.input-tint;
+    }
+    // The software renderer clips children to rectangular bounds. Mask the
+    // standard editor's corners before drawing the focus outline on top.
+    Rectangle {
+        x: -root.border-radius; y: -root.border-radius;
+        width: parent.width + 2 * root.border-radius;
+        height: parent.height + 2 * root.border-radius;
+        border-width: root.border-radius;
+        border-radius: 2 * root.border-radius;
+        border-color: root.surrounding-background;
+    }
+    FlatSurface {
+        width: parent.width; height: parent.height;
+        border-radius: root.border-radius;
+        clip: true;
+        outline-color: editor.has-focus ? UiSurface.focus : root.normal-outline-color;
+        outline-focused: editor.has-focus;
+        background: transparent;
+    }
+}

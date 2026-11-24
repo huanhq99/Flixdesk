@@ -1,0 +1,71 @@
+function setup_options_and_dependencies(enable_dependencies)
+    option("CROSSDESK_UPDATE_PUBLIC_KEY")
+        set_showmenu(true)
+        set_description("Ed25519 public key (64 lowercase hex characters); empty disables automatic installation")
+    option_end()
+
+    option("CROSSDESK_VERSION")
+        set_default("1.7.7")
+        set_showmenu(true)
+        set_description("Set CROSSDESK_VERSION for build")
+    option_end()
+
+    option("USE_CUDA")
+        set_default(false)
+        set_showmenu(true)
+        set_description("Use CUDA for hardware codec acceleration")
+    option_end()
+
+    option("USE_WAYLAND")
+        set_default(false)
+        set_showmenu(true)
+        set_description("Enable Wayland capture on Linux (assumes dependencies are installed)")
+    option_end()
+
+    option("USE_DRM")
+        set_default(false)
+        set_showmenu(true)
+        set_description("Enable DRM capture on Linux (assumes dependencies are installed)")
+    option_end()
+
+    option("CROSSDESK_PORTABLE")
+        set_default(false)
+        set_showmenu(true)
+        set_description("Build CrossDesk as a portable package that stores data beside the executable")
+    option_end()
+
+    -- Keep options discoverable when switching back from a CLI-only build.
+    if enable_dependencies == false then
+        return
+    end
+
+    -- set_policy("build.warning", true)
+    -- set_warnings("all", "extra")
+    -- add_cxxflags("/W4", "/WX")
+
+    add_defines("UNICODE")
+    add_defines("USE_CUDA=" .. (is_config("USE_CUDA", true) and "1" or "0"))
+    add_defines("USE_WAYLAND=" .. (is_config("USE_WAYLAND", true) and "1" or "0"))
+    add_defines("USE_DRM=" .. (is_config("USE_DRM", true) and "1" or "0"))
+    if is_mode("debug") then
+        add_defines("CROSSDESK_DEBUG", "SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG")
+    else
+        add_defines("SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO")
+    end
+
+    add_requireconfs("**.python", {version = "3.12", override = true, configs = {pgo = false}})
+    -- Keep application and build-tool dependencies on the same OpenSSL release.
+    add_requireconfs("**.openssl", "**.openssl3",
+        {version = "3.3.2", system = false, override = true})
+    add_requires("spdlog 1.14.1", {system = false})
+    add_requires("slint 1.17.1", {configs = {shared = true}})
+    if is_plat("linux") then
+        add_requires("crossdesk_sdl3 3.2.26", {alias = "libsdl3", system = false,
+            configs = {shared = false}})
+    else
+        add_requires("libsdl3 3.2.26", {configs = {shared = false}})
+    end
+    add_requires("openssl3 3.3.2", {system = false})
+    add_requires("cpp-httplib v0.26.0", {configs = {ssl = true}})
+    add_requires("tinyfiledialogs 3.15.1")
+end

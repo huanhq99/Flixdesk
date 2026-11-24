@@ -1,0 +1,219 @@
+/*
+ * @Author: DI JUNKUN
+ * @Date: 2025-06-19
+ * Copyright (c) 2025 by DI JUNKUN, All Rights Reserved.
+ */
+
+#ifndef _DEVICE_DB_MANAGER_H_
+#define _DEVICE_DB_MANAGER_H_
+
+#include <sqlite3.h>
+
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <mutex>
+#include <nlohmann/json.hpp>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include "device_password.h"
+
+struct DeviceCredential {
+  std::string device_id;
+  std::string password;
+  bool update;
+};
+
+struct ReconnectCredential {
+  std::string token;
+  int64_t expires_at = 0;
+};
+
+struct OnlineDeviceInfo {
+  std::string device_id;
+  bool online = false;
+  int64_t updated_at = 0;
+  int64_t online_since = 0;
+  int64_t online_duration_seconds = 0;
+  int64_t current_control_seconds = 0;
+  int64_t current_controlled_seconds = 0;
+  int64_t active_control_count = 0;
+  int64_t active_controlled_count = 0;
+  std::vector<std::string> active_control_targets;
+  std::vector<std::string> active_controlled_by;
+  std::string client_version;
+  std::string client_platform;
+};
+
+struct DevicePresenceCounts {
+  int64_t all = 0;
+  int64_t online = 0;
+  int64_t offline = 0;
+  int64_t active = 0;  // Distinct devices currently being controlled.
+  int64_t web = 0;
+  int64_t cli = 0;
+};
+
+struct DeviceClientFilterOptions {
+  std::vector<std::string> platforms;
+  std::vector<std::string> versions;
+};
+
+struct OnlineDurationStats {
+  int64_t current_online_seconds = 0;
+};
+
+struct RemoteControlSessionInfo {
+  std::string transmission_id;
+  std::string host_id;
+  std::vector<std::string> guest_ids;
+  int64_t started_at = 0;
+};
+
+struct RetentionCleanupResult {
+  size_t devices = 0;
+  size_t associations = 0;
+  size_t credentials = 0;
+  std::vector<std::string> device_ids;
+  bool more = false;
+};
+
+class DeviceDBManager {
+ public:
+  enum class OpenMode { ReadWrite, ReadOnly };
+  explicit DeviceDBManager(const std::string& db_path,
+                           OpenMode mode = OpenMode::ReadWrite);
+  ~DeviceDBManager();
+  // Only the dedicated reader worker sets this; writers keep their existing
+  // transaction behavior. SQLite's progress handler bounds expensive reads.
+  void SetReadDeadline(std::chrono::steady_clock::time_point deadline);
+  bool ClearReadDeadline();
+
+  DeviceDBManager(const DeviceDBManager&) = delete;
+  DeviceDBManager& operator=(const DeviceDBManager&) = delete;
+
+  DeviceCredential AddDevice(const std::string& device_id,
+                             const std::string& password);
+
+  bool UpdatePassword(const std::string& device_id,
+                      const std::string& new_password);
+
+  int VerifyDevice(const std::string& device_id, const std::string& password);
+  // Snapshot/compute/commit lets credential workers hash without holding the
+  // SQLite mutex. The signaling worker rechecks identity before committing.
+  std::optional<DevicePasswordRecord> ReadPassword(
+      const std::string& device_id);
+  bool CommitPassword(const std::string& device_id,
+                      const DevicePasswordRecord& expected,
+                      const DevicePasswordRecord& replacement);
+  DeviceCredential RegisterDevice(const std::string& kind,
+                                  const std::string& password,
+                                  const DevicePasswordRecord& record,
+                                  const std::string& login_public_key = "");
+  // nullopt means unavailable/missing; an empty key is a legacy identity.
+  std::optional<std::string> ReadLoginPublicKey(const std::string& device_id);
+  // Call only after password verification; never replaces an existing binding.
+  bool BindLoginPublicKey(const std::string& device_id,
+                         const DevicePasswordRecord& verified,
+                         const std::string& public_key);
+  bool RemoveDevice(const std::string& device_id);
+  // Only persistent device identities receive credentials. Store the digest,
+  // never the bearer token; successful password login replaces the old token.
+  std::optional<ReconnectCredential> IssueReconnectCredential(
+      const std::string& device_id);
+  std::optional<int64_t> VerifyReconnectCredential(
+      const std::string& device_id, const std::string& token);
+  bool RevokeReconnectCredential(const std::string& device_id);
+
+  bool SetDeviceOnline(const std::string& device_id, bool online);
+  bool UpdateDeviceClientInfo(const std::string& device_id,
+                              const std::string& client_version,
+                              const std::string& client_platform);
+  bool RecordRuntimeHeartbeat();
+  // Calendar-day controller counts, available only through the admin API.
+  nlohmann::json GetDailyControllerStats();
+  // Deletes expired offline identities, presence and associations together.
+  // A device and its controller clone share the latest activity deadline.
+  // Batches share the writer's transaction ordering with login/logout.
+  RetentionCleanupResult CleanupExpiredDevices(int retention_days,
+                                              size_t batch_size = 200);
+  // Web/CLI identities last only for their connection. An optional exact ID
+  // supports disconnect cleanup; batches drain old offline records. Neither
+  // path removes daily activity or identities referenced by live sessions.
+  RetentionCleanupResult CleanupTemporaryControllers(
+      size_t batch_size = 200, const std::string& device_id = "");
+  // Admin-only writer operation. All actions audit in the same transaction;
+  // cleanup requires an unchanged preview and no online/recoverable sessions.
+  nlohmann::json AdminDeviceData(const std::string& device_id,
+      const std::string& action, const std::string& scope,
+      const std::string& expected_revision, const std::string& actor,
+      const std::string& request_ref);
+  bool CleanupAdminDataAudit(int retention_days);
+  nlohmann::json RiskRules();
+  bool SetRiskRule(const std::string& scope, const std::string& target,
+                   int64_t expires_at, const std::string& reason);
+  bool DeleteRiskRule(const std::string& scope, const std::string& target);
+  std::optional<int> PasswordRiskDelay(const std::string& source,
+                                      const std::string& verified_controller);
+  bool StartRemoteControlSession(const std::string& transmission_id,
+                                 const std::string& host_id,
+                                 const std::string& guest_id);
+  bool EndRemoteControlSession(const std::string& transmission_id,
+                               const std::string& host_id,
+                               const std::string& guest_id);
+  bool EndRemoteControlTransmission(const std::string& transmission_id);
+  int CountActiveRemoteControlConnections();
+  int CountRemoteControlTransmissions(const std::string& search = "");
+  std::vector<RemoteControlSessionInfo> ListRemoteControlSessions(
+      size_t limit, size_t offset, const std::string& search = "");
+  int GetOnlineDeviceCount();
+  int CountOnlineDevices(const std::string& search = "");
+  int CountDevicePresence(const std::string& search = "",
+                          const std::string& filter = "all",
+                          const std::string& kind = "pc",
+                          const std::string& platform = "",
+                          const std::string& version = "");
+  DevicePresenceCounts CountDevicePresenceByFilters(
+      const std::string& search = "", const std::string& kind = "pc",
+      const std::string& platform = "", const std::string& version = "");
+  DeviceClientFilterOptions ListDeviceClientFilterOptions(
+      const std::string& kind = "pc");
+  OnlineDurationStats GetOnlineDurationStats();
+  std::vector<OnlineDeviceInfo> ListOnlineDevices();
+  std::vector<OnlineDeviceInfo> ListOnlineDevices(
+      size_t limit, size_t offset, const std::string& search);
+  std::vector<OnlineDeviceInfo> ListDevicePresence(
+      size_t limit, size_t offset, const std::string& search,
+      const std::string& filter = "all",
+      const std::string& sort = "status",
+      const std::string& order = "desc", const std::string& kind = "pc",
+      const std::string& platform = "", const std::string& version = "");
+  std::vector<std::pair<std::string, bool>> BatchQueryOnline(
+      const std::vector<std::string>& device_ids);
+  bool SetUserDevices(const std::string& user_id,
+                      const std::vector<std::string>& device_ids);
+  std::vector<std::string> GetUserDevices(const std::string& user_id);
+
+ private:
+  void InitDB();
+  std::string GenerateDeviceId();
+  bool DeviceIdExists(const std::string& device_id);
+  int64_t GetRuntimeLastSeen();
+  void InitDailyControllerActivity();
+  void RefreshDailyControllerActivity(int64_t now);
+  void RecordDailyControllerActivity(int64_t now,
+                                    const std::string& transmission_id = "",
+                                    const std::string& guest_id = "");
+  void UpdateDailyControllerKind(const std::string& device_id,
+                                 const std::string& platform);
+
+ private:
+  std::chrono::steady_clock::time_point read_deadline_ = (std::chrono::steady_clock::time_point::max)();
+  sqlite3* db_;
+  int64_t activity_day_ = 0;
+  mutable std::recursive_mutex db_mutex_;
+};
+
+#endif  // _DEVICE_DB_MANAGER_H_

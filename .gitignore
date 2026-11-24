@@ -1,0 +1,23 @@
+# Environment & secrets
+.env
+server/.env
+*.key
+*.pem
+*.crt
+*.csr
+
+# Build & IDE outputs
+build/
+.xmake/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Runtime data & logs
+server/data/
+server/logs/
+*.db
+*.db-wal
+*.db-shm
+*.log

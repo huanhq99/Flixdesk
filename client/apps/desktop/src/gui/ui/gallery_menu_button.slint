@@ -1,0 +1,164 @@
+import { SurfaceSeparator, FlatSurface, UiSurface } from "ui_surface.slint";
+import { UiRadius } from "ui_radius.slint";
+import { CompactButton, FontAwesomeIcons, ControlStyle } from "common.slint";
+
+export struct GalleryMenuItem { label: string, enabled: bool }
+
+export component GalleryMenuButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    in property <bool> opens-up: false;
+    in property <bool> compact-trigger: false;
+    in property <bool> compact-menu: false;
+    in property <length> menu-width: 200px;
+    in property <length> horizontal-padding: 12px;
+    out property <length> preferred-button-width: ceil(button-label.preferred-width / 1px) * 1px + root.horizontal-padding * 2 + 18px;
+    in property <[GalleryMenuItem]> items;
+    in property <[string]> item-icons;
+    in property <int> destructive-index: -1;
+    out property <bool> menu-open: popup.is-open;
+    private property <length> row-height: root.compact-menu ? 24px : 30px;
+    private property <length> menu-padding: root.compact-menu ? 3px : 4px;
+    private property <length> divider-spacing: root.compact-menu ? 5px : 7px;
+    private property <int> current-index: 0;
+    callback opened;
+    callback selected(int);
+
+    height: 24px;
+    forward-focus: trigger-focus;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-expandable: true;
+    accessible-expanded: popup.is-open;
+    accessible-action-default => { root.open-menu(); }
+    changed enabled => { if !root.enabled { popup.close(); } }
+    changed visible => { if !root.visible { popup.close(); } }
+
+    public function close-menu() { popup.close(); }
+    function open-menu() {
+        if !root.enabled || root.items.length == 0 { return; }
+        if popup.is-open { popup.close(); return; }
+        root.opened();
+        root.current-index = 0;
+        popup.show();
+    }
+    function choose(index: int) {
+        if !root.enabled || index < 0 || index >= root.items.length || !root.items[index].enabled { return; }
+        popup.close();
+        trigger-focus.focus();
+        root.selected(index);
+    }
+    function handle-key(event: KeyEvent) -> EventResult {
+        if !root.enabled { return reject; }
+        if event.text == Key.Escape && popup.is-open {
+            popup.close(); trigger-focus.focus(); return accept;
+        }
+        if event.text == Key.Return || event.text == " " {
+            if popup.is-open { root.choose(root.current-index); } else { root.open-menu(); }
+            return accept;
+        }
+        if event.text == Key.UpArrow || event.text == Key.DownArrow {
+            if !popup.is-open { root.open-menu(); }
+            else { root.current-index = clamp(root.current-index + (event.text == Key.UpArrow ? -1 : 1), 0, root.items.length - 1); }
+            return accept;
+        }
+        return reject;
+    }
+    trigger-focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => { return root.handle-key(event); }
+        if !root.compact-trigger: CompactButton {
+            width: parent.width; height: parent.height;
+            border-radius: UiRadius.control;
+            enabled: root.enabled; primary: root.primary;
+            clicked => { trigger-focus.focus(); root.open-menu(); }
+        }
+        button-label := Text {
+            visible: !root.compact-trigger;
+            x: root.horizontal-padding; width: parent.width - root.horizontal-padding * 2 - 18px; height: parent.height;
+            text: root.text; color: root.enabled ? #24272d : #8e9298;
+            font-size: 11px; overflow: elide; horizontal-alignment: center; vertical-alignment: center;
+        }
+        Text {
+            visible: !root.compact-trigger;
+            x: parent.width - root.horizontal-padding - 12px; width: 12px; height: parent.height;
+            text: root.opens-up ? FontAwesomeIcons.angle-up : FontAwesomeIcons.angle-down;
+            font-family: "Font Awesome 6 Free"; font-weight: 900; font-size: 9px;
+            color: root.enabled ? #62666d : #8e9298;
+            horizontal-alignment: center; vertical-alignment: center;
+        }
+        if root.compact-trigger: FlatSurface {
+            background: more-touch.pressed || popup.is-open ? ControlStyle.selected : more-touch.has-hover ? ControlStyle.hover : white;
+            border-radius: UiRadius.menu;
+            outline-color: trigger-focus.has-focus ? UiSurface.focus : UiSurface.edge;
+            animate background, outline-color { duration: 120ms; }
+            for dot in 3: Rectangle {
+                x: parent.width / 2 - 6px + dot * 5px;
+                y: (parent.height - self.height) / 2;
+                width: 2px; height: 2px; border-radius: 1px;
+                background: #35445e;
+            }
+            more-touch := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: pointer;
+                clicked => { trigger-focus.focus(); root.open-menu(); }
+            }
+        }
+    }
+    popup := PopupWindow {
+        x: root.width - self.width;
+        y: root.opens-up ? -self.height - 4px : root.height + 4px;
+        width: root.menu-width;
+        height: root.items.length * root.row-height + root.menu-padding * 2
+            + (root.destructive-index > 0 ? root.divider-spacing : 0px);
+        close-policy: close-on-click-outside;
+        forward-focus: popup-focus;
+        popup-focus := FocusScope {
+            key-pressed(event) => { return root.handle-key(event); }
+            FlatSurface {
+                background: white; outline-color: UiSurface.edge; border-radius: UiRadius.menu;
+                clip: true;
+                if root.destructive-index > 0: SurfaceSeparator {
+                    x: 10px; y: root.menu-padding + root.destructive-index * root.row-height + (root.divider-spacing - 1px) / 2;
+                    width: parent.width - 20px; height: 1px; outline-color: UiSurface.separator;
+                }
+                for item[index] in root.items: Rectangle {
+                    private property <bool> destructive: index == root.destructive-index;
+                    private property <bool> has-icon: index < root.item-icons.length && root.item-icons[index] != "";
+                    private property <color> foreground: !item.enabled ? #92979f : self.destructive ? #c43c43 : #30343b;
+                    x: root.menu-padding;
+                    y: root.menu-padding + index * root.row-height
+                        + (root.destructive-index > 0 && index >= root.destructive-index ? root.divider-spacing : 0px);
+                    width: parent.width - root.menu-padding * 2; height: root.row-height;
+                    border-radius: UiRadius.control;
+                    background: item.enabled && index == root.current-index
+                        ? (self.destructive ? (item-touch.pressed ? #f6babb : #fbe0e0)
+                            : item-touch.pressed ? ControlStyle.pressed : ControlStyle.hover) : transparent;
+                    accessible-role: button; accessible-label: item.label; accessible-enabled: item.enabled;
+                    accessible-action-default => { root.choose(index); }
+                    if self.has-icon: Text {
+                        x: root.compact-menu ? 8px : 10px;
+                        width: root.compact-menu ? 12px : 14px; height: parent.height;
+                        text: root.item-icons[index]; color: parent.foreground;
+                        font-family: "Font Awesome 6 Free"; font-weight: 900; font-size: root.compact-menu ? 10px : 11px;
+                        horizontal-alignment: center; vertical-alignment: center;
+                    }
+                    Text {
+                        x: parent.has-icon ? (root.compact-menu ? 28px : 34px) : 10px;
+                        width: parent.width - self.x - 10px; height: parent.height;
+                        text: item.label; color: parent.foreground;
+                        font-size: root.compact-menu ? 11px : 12px; vertical-alignment: center;
+                    }
+                    item-touch := TouchArea {
+                        enabled: item.enabled;
+                        mouse-cursor: pointer;
+                        changed has-hover => { if self.has-hover { root.current-index = index; } }
+                        clicked => { root.choose(index); }
+                    }
+                }
+            }
+        }
+    }
+}

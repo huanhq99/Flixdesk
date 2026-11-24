@@ -1,0 +1,22 @@
+**
+
+!.dockerignore
+!docker/
+!docker/linux-build/
+!docker/linux-build/**
+
+# Dependency manifests and local xmake package recipes are the only project
+# files needed while pre-warming the build image.
+!xmake.lua
+!apps/
+!apps/desktop/
+!apps/desktop/xmake/
+!apps/desktop/xmake/**
+!deps/thirdparty/
+!deps/thirdparty/**
+!deps/submodules/
+!deps/submodules/xmake.lua
+!deps/submodules/minirtc/
+!deps/submodules/minirtc/xmake.lua
+!deps/submodules/minirtc/thirdparty/
+!deps/submodules/minirtc/thirdparty/**
