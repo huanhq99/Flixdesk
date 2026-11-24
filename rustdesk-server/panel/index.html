@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flixdesk 控制台 (RustDesk 内核)</title>
+  <style>
+    :root {
+      --bg: #0b1120; --card: #131c31; --border: #253351;
+      --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
+      --primary-hover: #2563eb; --ok: #22c55e; --err: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 22px; flex-wrap: wrap; gap: 12px; }
+    h1 { margin: 0; font-size: 22px; display: flex; align-items: center; gap: 10px; }
+    .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; font-weight: 600; }
+    .badge.ok { background: rgba(34,197,94,.18); color: #4ade80; }
+    .badge.err { background: rgba(239,68,68,.18); color: #f87171; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 20px; margin-bottom: 18px; }
+    .card h2 { margin: 0 0 14px; font-size: 16px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+    .stat { background: #0b1120; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v { font-size: 15px; font-weight: 600; margin-top: 4px; word-break: break-all; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%; background: #0b1120; border: 1px solid var(--border); border-radius: 8px;
+      padding: 9px 11px; color: var(--text); font-size: 14px; font-family: inherit;
+    }
+    input:focus { outline: none; border-color: var(--primary); }
+    .copy-box { display: flex; gap: 8px; align-items: center; }
+    .copy-box input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    button { background: var(--primary); color: #fff; border: none; border-radius: 8px; padding: 9px 15px; font-size: 14px; cursor: pointer; font-weight: 500; }
+    button:hover { background: var(--primary-hover); }
+    button.secondary { background: #253351; }
+    button.secondary:hover { background: #33466d; }
+    button.danger { background: #b91c1c; }
+    button.danger:hover { background: #991b1b; }
+    .chk { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); cursor: pointer; margin-top: 8px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 500; }
+    pre.logs { background: #020617; border: 1px solid var(--border); border-radius: 10px; padding: 12px; max-height: 260px; overflow: auto; font-size: 12px; color: #cbd5e1; white-space: pre-wrap; margin: 0; }
+    .toast { position: fixed; right: 20px; bottom: 20px; background: #1e293b; border: 1px solid var(--primary); padding: 12px 18px; border-radius: 10px; display: none; box-shadow: 0 10px 30px rgba(0,0,0,.45); z-index: 99; }
+    .auth-box { max-width: 400px; margin: 90px auto; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div id="authView" class="card auth-box hidden">
+      <h2 id="authTitle">初始化 Flixdesk 控制台</h2>
+      <p class="hint" id="authDesc">首次访问请设置管理密码（至少 6 位）。</p>
+      <label>管理密码</label>
+      <input type="password" id="authPassword" placeholder="输入密码" />
+      <div class="row"><button id="authSubmitBtn" onclick="submitAuth()">进入控制台</button></div>
+    </div>
+
+    <div id="mainView" class="hidden">
+      <header>
+        <h1>Flixdesk 控制台 <span id="overallBadge" class="badge err">检查中</span></h1>
+        <div class="row" style="margin:0;">
+          <button class="secondary" onclick="refreshAll()">刷新状态</button>
+          <button class="secondary" onclick="logout()">退出登录</button>
+        </div>
+      </header>
+
+      <div class="card">
+        <h2>运行状态与客户端连接信息（免证书直连）</h2>
+        <div class="grid" style="margin-bottom:14px;">
+          <div class="stat"><div class="k">ID / 信令服务 (hbbs)</div><div class="v" id="stHbbs">-</div></div>
+          <div class="stat"><div class="k">中继服务 (hbbr)</div><div class="v" id="stHbbr">-</div></div>
+          <div class="stat"><div class="k">已注册设备数</div><div class="v" id="stPeers">0</div></div>
+        </div>
+
+        <div class="grid">
+          <div>
+            <label>ID 服务器 / 中继服务器</label>
+            <div class="copy-box">
+              <input type="text" id="outHost" readonly />
+              <button class="secondary" onclick="copyField('outHost')">复制</button>
+            </div>
+          </div>
+          <div>
+            <label>公钥 Key（客户端无需导入任何证书）</label>
+            <div class="copy-box">
+              <input type="text" id="outKey" readonly />
+              <button class="secondary" onclick="copyField('outKey')">复制</button>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:12px;">
+          <label>RustDesk / Flixdesk 客户端一键导入配置串（设置 → 网络 → 导入服务器配置）</label>
+          <div class="copy-box">
+            <input type="text" id="outImport" readonly />
+            <button onclick="copyField('outImport')">一键复制导入串</button>
+          </div>
+        </div>
+        <div class="row">
+          <button onclick="serviceAction('restart')">重启服务</button>
+          <button class="danger" onclick="serviceAction('stop')">停止服务</button>
+          <button class="secondary" onclick="regenKey()">重新生成 Key</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>服务器配置</h2>
+        <div class="grid">
+          <div>
+            <label>公网 IP 或域名 (ID / Relay 地址)</label>
+            <input type="text" id="public_host" placeholder="例如 140.210.12.140" />
+          </div>
+          <div>
+            <label>中继端口 (默认 21117)</label>
+            <input type="number" id="relay_port" value="21117" />
+          </div>
+        </div>
+        <label class="chk"><input type="checkbox" id="force_key" checked /> 强制校验 Key（-k _，强烈推荐开启，防止他人白嫖你的中继服务器）</label>
+        <label class="chk"><input type="checkbox" id="always_use_relay" /> 始终走服务器中继（默认关闭，优先 P2P 直连，直连不通自动切中继）</label>
+        <div class="row">
+          <button onclick="saveConfig()">保存配置并重启</button>
+          <button class="secondary" onclick="detectIp()">自动探测公网 IP</button>
+        </div>
+        <p class="hint">防火墙仅需放行：21114/TCP（本控制台）、21115–21119/TCP、21116/UDP（无需开放上万个 UDP 端口）。</p>
+      </div>
+
+      <div class="card">
+        <h2>已注册设备列表</h2>
+        <table>
+          <thead><tr><th>设备 ID</th><th>首次注册时间</th></tr></thead>
+          <tbody id="peersBody"><tr><td colspan="2" style="color:var(--muted)">暂无设备</td></tr></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>实时日志</h2>
+        <pre id="logsBox" class="logs">加载中...</pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    let authMode = 'login';
+    function toast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      setTimeout(() => t.style.display = 'none', 2800);
+    }
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { headers: { 'Content-Type': 'application/json' }, ...opts });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || data.message || ('HTTP ' + res.status));
+      return data;
+    }
+    function copyField(id) {
+      const val = document.getElementById(id).value;
+      if (!val) return toast('内容为空');
+      navigator.clipboard.writeText(val).then(() => toast('已复制到剪贴板')).catch(() => {
+        document.getElementById(id).select();
+        document.execCommand('copy');
+        toast('已复制');
+      });
+    }
+    async function init() {
+      const st = await api('/api/auth/state');
+      if (!st.initialized) {
+        authMode = 'setup';
+        document.getElementById('authView').classList.remove('hidden');
+      } else if (!st.authenticated) {
+        authMode = 'login';
+        document.getElementById('authTitle').textContent = '登录 Flixdesk 控制台';
+        document.getElementById('authDesc').textContent = '请输入你设置的管理密码。';
+        document.getElementById('authSubmitBtn').textContent = '登录';
+        document.getElementById('authView').classList.remove('hidden');
+      } else {
+        document.getElementById('mainView').classList.remove('hidden');
+        await refreshAll();
+      }
+    }
+    async function submitAuth() {
+      try {
+        await api(authMode === 'setup' ? '/api/auth/setup' : '/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ password: document.getElementById('authPassword').value }),
+        });
+        location.reload();
+      } catch (e) { toast(e.message); }
+    }
+    async function logout() {
+      await api('/api/auth/logout', { method: 'POST', body: '{}' });
+      location.reload();
+    }
+    async function refreshAll() {
+      const [st, cfg, lg] = await Promise.all([api('/api/status'), api('/api/config'), api('/api/logs')]);
+      const ok = st.hbbs_running && st.hbbr_running;
+      const badge = document.getElementById('overallBadge');
+      badge.textContent = ok ? '运行中' : '未完全启动';
+      badge.className = 'badge ' + (ok ? 'ok' : 'err');
+      document.getElementById('stHbbs').textContent = st.hbbs_running ? `运行中 (PID ${st.hbbs_pid})` : '已停止';
+      document.getElementById('stHbbr').textContent = st.hbbr_running ? `运行中 (PID ${st.hbbr_pid})` : '已停止';
+      document.getElementById('stPeers').textContent = (st.peers || []).length;
+      document.getElementById('outHost').value = st.public_host || location.hostname;
+      document.getElementById('outKey').value = st.public_key || '正在生成，请稍候刷新...';
+      document.getElementById('outImport').value = st.client_config_string || '';
+      document.getElementById('public_host').value = cfg.public_host || '';
+      document.getElementById('relay_port').value = cfg.relay_port || 21117;
+      document.getElementById('force_key').checked = !!cfg.force_key;
+      document.getElementById('always_use_relay').checked = !!cfg.always_use_relay;
+
+      const body = document.getElementById('peersBody');
+      if (st.peers && st.peers.length) {
+        body.innerHTML = st.peers.map(p => `<tr><td><code>${p.id}</code></td><td>${p.created_at}</td></tr>`).join('');
+      } else {
+        body.innerHTML = '<tr><td colspan="2" style="color:var(--muted)">暂无已注册设备</td></tr>';
+      }
+      document.getElementById('logsBox').textContent = (lg.lines || []).join('\n') || '暂无日志';
+    }
+    async function saveConfig() {
+      try {
+        const res = await api('/api/config', {
+          method: 'POST',
+          body: JSON.stringify({
+            public_host: document.getElementById('public_host').value,
+            relay_port: document.getElementById('relay_port').value,
+            force_key: document.getElementById('force_key').checked,
+            always_use_relay: document.getElementById('always_use_relay').checked,
+          }),
+        });
+        toast(res.message || '已保存并重启');
+        setTimeout(refreshAll, 900);
+      } catch (e) { toast(e.message); }
+    }
+    async function detectIp() {
+      const res = await api('/api/detect-ip', { method: 'POST', body: '{}' });
+      if (res.public_host) document.getElementById('public_host').value = res.public_host;
+      toast('已自动探测公网 IP');
+    }
+    async function serviceAction(act) {
+      const res = await api('/api/service/' + act, { method: 'POST', body: '{}' });
+      toast(res.message || '操作完成');
+      setTimeout(refreshAll, 800);
+    }
+    async function regenKey() {
+      if (!confirm('重新生成 Key 后，所有已连接的客户端都需要更新 Key，确定吗？')) return;
+      const res = await api('/api/key/regenerate', { method: 'POST', body: '{}' });
+      toast(res.message || '已重新生成');
+      setTimeout(refreshAll, 1000);
+    }
+    document.getElementById('authPassword').addEventListener('keydown', e => { if (e.key === 'Enter') submitAuth(); });
+    init();
+  </script>
+</body>
+</html>
