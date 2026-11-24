@@ -30,7 +30,8 @@ if [[ -n "${CROSSDESK_MACOS_KEYCHAIN:-}" ]]; then
     SIGN_ARGS+=(--keychain "$CROSSDESK_MACOS_KEYCHAIN")
 fi
 
-for executable in CrossDesk crossdesk_updater; do
+EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || echo CrossDesk)"
+for executable in "$EXECUTABLE_NAME" crossdesk_updater; do
     if [[ ! -x "$APP_BUNDLE/Contents/MacOS/$executable" ]]; then
         echo "Missing app executable: $APP_BUNDLE/Contents/MacOS/$executable" >&2
         exit 1

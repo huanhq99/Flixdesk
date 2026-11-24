@@ -9,9 +9,10 @@ fi
 APP_BUNDLE="$1"
 EXPECTED_ARCH="$2"
 EXPECTED_SDK_VERSION="${3:-}"
-APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/CrossDesk"
-FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
 INFO_PLIST="$APP_BUNDLE/Contents/Info.plist"
+EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$INFO_PLIST" 2>/dev/null || echo CrossDesk)"
+APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/$EXECUTABLE_NAME"
+FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
 
 if [[ ! -x "$APP_EXECUTABLE" ]]; then
     echo "Missing app executable: $APP_EXECUTABLE" >&2

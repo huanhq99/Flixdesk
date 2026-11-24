@@ -2,13 +2,13 @@
 !addincludedir "${__FILEDIR__}"
 
 ; Installer initial constants
-!define PRODUCT_NAME "CrossDesk"
+!define PRODUCT_NAME "Flixdesk"
 !define PRODUCT_VERSION "${VERSION}"
 !define PRODUCT_VERSION_NUMERIC "${VERSION_NUMERIC}"
-!define PRODUCT_PUBLISHER "CrossDesk"
-!define PRODUCT_WEB_SITE "https://www.crossdesk.cn/"
-!define APP_NAME "CrossDesk"
-!define UNINSTALL_REG_KEY "CrossDesk"
+!define PRODUCT_PUBLISHER "Flixdesk"
+!define PRODUCT_WEB_SITE "https://github.com/huanhq99/Flixdesk"
+!define APP_NAME "Flixdesk"
+!define UNINSTALL_REG_KEY "Flixdesk"
 !define PRODUCT_SERVICE_NAME "CrossDeskService"
 
 ; Installer icon path
@@ -55,14 +55,14 @@ FunctionEnd
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "crossdesk-win-x64-${PRODUCT_VERSION}.exe"
 VIProductVersion "${PRODUCT_VERSION_NUMERIC}"
-VIAddVersionKey /LANG=2052 "CompanyName" "CrossDesk"
-VIAddVersionKey /LANG=2052 "FileDescription" "CrossDesk Installer"
+VIAddVersionKey /LANG=2052 "CompanyName" "Flixdesk"
+VIAddVersionKey /LANG=2052 "FileDescription" "Flixdesk Installer"
 VIAddVersionKey /LANG=2052 "FileVersion" "${PRODUCT_VERSION}"
-VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (C) CrossDesk contributors"
-VIAddVersionKey /LANG=2052 "OriginalFilename" "crossdesk-win-x64-${PRODUCT_VERSION}.exe"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (C) Flixdesk & CrossDesk contributors"
+VIAddVersionKey /LANG=2052 "OriginalFilename" "flixdesk-win-x64-${PRODUCT_VERSION}.exe"
 VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
-InstallDir "$PROGRAMFILES\CrossDesk"
+InstallDir "$PROGRAMFILES\Flixdesk"
 InstallDirRegKey HKCU "Software\${PRODUCT_NAME}" "InstallDir"
 ShowInstDetails show
 

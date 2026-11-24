@@ -1645,19 +1645,19 @@ void GuiApplication::InitializeSystemTray() {
   ui_->tray = std::make_unique<WinTray>(
       std::move(show_window), std::move(hide_window),
       std::move(open_settings), std::move(exit_app), LoadSlintTrayIcon(),
-      L"CrossDesk", localization_language_index_);
+      L"Flixdesk", localization_language_index_);
 #elif defined(__APPLE__)
   ui_->tray = std::make_unique<MacTray>(
       std::move(show_window), std::move(hide_window), std::move(open_settings),
-      std::move(exit_app), "CrossDesk", localization_language_index_);
+      std::move(exit_app), "Flixdesk", localization_language_index_);
 #elif defined(__OHOS__)
   ui_->tray = std::make_unique<HarmonyTray>(
       std::move(show_window), std::move(hide_window), std::move(open_settings),
-      std::move(exit_app), "CrossDesk", localization_language_index_);
+      std::move(exit_app), "Flixdesk", localization_language_index_);
 #elif (defined(__linux__) && !defined(__OHOS__))
   ui_->tray = std::make_unique<LinuxTray>(
       std::move(show_window), std::move(hide_window),
-      std::move(open_settings), std::move(exit_app), "CrossDesk",
+      std::move(open_settings), std::move(exit_app), "Flixdesk",
       localization_language_index_);
 #endif
 #endif
@@ -3850,7 +3850,7 @@ void GuiApplication::SyncXWaylandWindowActivation() {
   const auto pid = active_window ? X11GetWindowProcessId(display, active_window) : std::nullopt;
   const auto title = active_window && (!pid || *pid == static_cast<unsigned long>(getpid()))
                          ? X11WindowTitle(display, active_window) : std::string{};
-  ui_->main->set_window_active(title == "CrossDesk");
+  ui_->main->set_window_active(title == "Flixdesk");
   const bool wall_active = title == std::string(ui_->wall->get_window_title());
   ui_->wall->set_window_active(wall_active);
   if (!wall_active && !ui_->gallery_control_id.empty()) ReleaseControl();

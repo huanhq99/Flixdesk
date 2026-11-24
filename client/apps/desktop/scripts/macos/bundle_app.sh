@@ -9,7 +9,8 @@ fi
 APP_BUNDLE="$1"
 EXPECTED_ARCH="$2"
 SLINT_LIBRARY="$3"
-APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/CrossDesk"
+EXECUTABLE_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_BUNDLE/Contents/Info.plist" 2>/dev/null || echo CrossDesk)"
+APP_EXECUTABLE="$APP_BUNDLE/Contents/MacOS/$EXECUTABLE_NAME"
 FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
 
 for command_name in codesign install_name_tool lipo otool strip; do
