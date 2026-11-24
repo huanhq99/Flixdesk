@@ -1,16 +1,28 @@
-name: Build Flixdesk Desktop Client
+name: Build & Release Flixdesk Desktop
 
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
     inputs:
       desktop_version:
-        description: "Desktop version (e.g. 1.7.7). Leave blank to use client/VERSION."
+        description: "Desktop version (e.g. 1.7.8). Leave blank to use client/VERSION."
+        required: false
+        type: string
+      release_notes:
+        description: "Optional release notes shown in GitHub Release and in-app update dialog."
         required: false
         type: string
       default_server_host:
-        description: "Optional default self-hosted server IP/domain to bake into the build (e.g. 140.210.12.140). Leave blank to keep default."
+        description: "Optional default self-hosted server IP/domain to bake into the build. Leave blank for generic build."
         required: false
         type: string
+      publish_release:
+        description: "Publish GitHub Release and update version.json for in-app update notifications"
+        required: false
+        default: true
+        type: boolean
       build_macos:
         description: "Build macOS Apple Silicon (arm64) installer (.pkg)"
         required: false
@@ -24,7 +36,7 @@ on:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 env:
   XMAKE_MIN_VERSION: "3.1.1"
@@ -35,33 +47,48 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
+      clean_version: ${{ steps.version.outputs.clean_version }}
+      release_date: ${{ steps.version.outputs.release_date }}
     steps:
       - uses: actions/checkout@v5
       - name: Resolve version
         id: version
         shell: bash
         run: |
-          if [[ -n "${{ inputs.desktop_version }}" ]]; then
-            BASE_VER="${{ inputs.desktop_version }}"
-          elif [[ -f client/VERSION ]]; then
-            BASE_VER="$(tr -d '[:space:]' < client/VERSION)"
+          TODAY="$(TZ=Asia/Shanghai date +%Y%m%d)"
+          ISO_DATE="$(TZ=Asia/Shanghai date +%Y-%m-%d)"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RAW_TAG="${GITHUB_REF#refs/tags/}"
+            if [[ "${RAW_TAG}" =~ ^v[0-9]+(\.[0-9]+){1,3}-[0-9]{8}$ ]]; then
+              VERSION_NUM="${RAW_TAG}"
+            else
+              VERSION_NUM="${RAW_TAG}-${TODAY}"
+            fi
           else
-            BASE_VER="1.7.7"
+            if [[ -n "${{ inputs.desktop_version }}" ]]; then
+              BASE_VER="${{ inputs.desktop_version }}"
+            elif [[ -f client/VERSION ]]; then
+              BASE_VER="$(tr -d '[:space:]' < client/VERSION)"
+            else
+              BASE_VER="1.7.8"
+            fi
+            BASE_VER="${BASE_VER#v}"
+            VERSION_NUM="v${BASE_VER}-${TODAY}"
           fi
-          BASE_VER="${BASE_VER#v}"
-          TODAY="$(date -u +%Y%m%d)"
-          echo "version=v${BASE_VER}-${TODAY}" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: v${BASE_VER}-${TODAY}"
+          CLEAN_VER="${VERSION_NUM#v}"
+          echo "version=${VERSION_NUM}" >> "$GITHUB_OUTPUT"
+          echo "clean_version=${CLEAN_VER}" >> "$GITHUB_OUTPUT"
+          echo "release_date=${ISO_DATE}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION_NUM} (${ISO_DATE})"
 
   build-macos-arm64:
     name: Build macOS (Apple Silicon)
     needs: prepare-version
-    if: ${{ inputs.build_macos != false }}
+    if: ${{ github.event_name == 'push' || inputs.build_macos != false }}
     runs-on: macos-26
     env:
       VERSION_NUM: ${{ needs.prepare-version.outputs.version }}
       MACOSX_DEPLOYMENT_TARGET: "14.0"
-      EXPECTED_MACOS_SDK: "26.5"
     steps:
       - name: Select Xcode 26.6
         shell: bash
@@ -124,7 +151,7 @@ jobs:
   build-windows-x64:
     name: Build Windows (x64)
     needs: prepare-version
-    if: ${{ inputs.build_windows != false }}
+    if: ${{ github.event_name == 'push' || inputs.build_windows != false }}
     runs-on: windows-2022
     env:
       VERSION_NUM: ${{ needs.prepare-version.outputs.version }}
@@ -197,3 +224,103 @@ jobs:
           name: flixdesk-win-x64-${{ env.VERSION_NUM }}
           path: client/apps/desktop/scripts/windows/flixdesk-win-x64-${{ env.VERSION_NUM }}.exe
           if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release & Update version.json
+    needs: [prepare-version, build-macos-arm64, build-windows-x64]
+    if: ${{ always() && (needs.build-macos-arm64.result == 'success' || needs.build-windows-x64.result == 'success') && (github.event_name == 'push' || inputs.publish_release != false) }}
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION_NUM: ${{ needs.prepare-version.outputs.version }}
+      CLEAN_VER: ${{ needs.prepare-version.outputs.clean_version }}
+      RELEASE_DATE: ${{ needs.prepare-version.outputs.release_date }}
+      RELEASE_NOTES: ${{ inputs.release_notes || 'Flixdesk desktop release (macOS Apple Silicon + Windows x64).' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: main
+
+      - name: Download built installers
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate updated version.json
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["VERSION_NUM"]
+          clean_ver = os.environ["CLEAN_VER"]
+          release_date = os.environ["RELEASE_DATE"]
+          release_notes = os.environ["RELEASE_NOTES"]
+
+          current_path = Path("version.json")
+          data = json.loads(current_path.read_text(encoding="utf-8")) if current_path.exists() else {}
+          downloads = dict(data.get("downloads") or {})
+
+          artifact_dir = Path("release-artifacts")
+          mapping = {
+              f"flixdesk-macos-arm64-{tag}.pkg": "macos-arm64",
+              f"flixdesk-win-x64-{tag}.exe": "windows-x64",
+          }
+
+          for filename, platform in mapping.items():
+              p = artifact_dir / filename
+              if not p.is_file():
+                  continue
+              h = hashlib.sha256()
+              with p.open("rb") as f:
+                  for chunk in iter(lambda: f.read(65536), b""):
+                      h.update(chunk)
+              downloads[platform] = {
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{filename}",
+                  "filename": filename,
+                  "version": clean_ver,
+                  "releaseDate": release_date,
+                  "size": p.stat().st_size,
+                  "sha256": h.hexdigest(),
+              }
+
+          updated = {
+              "latest_version": clean_ver,
+              "version": clean_ver,
+              "releaseDate": release_date,
+              "patch": 0,
+              "tagName": tag,
+              "releaseName": f"Flixdesk {tag}",
+              "releaseNotes": release_notes,
+              "downloads": downloads,
+          }
+          current_path.write_text(json.dumps(updated, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+          print(current_path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          if gh release view "${VERSION_NUM}" >/dev/null 2>&1; then
+            gh release upload "${VERSION_NUM}" release-artifacts/* version.json --clobber
+          else
+            gh release create "${VERSION_NUM}" release-artifacts/* version.json \
+              --title "Flixdesk ${VERSION_NUM}" \
+              --notes "${RELEASE_NOTES}" \
+              --latest
+          fi
+
+      - name: Commit updated version.json to main
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): update version.json for ${VERSION_NUM} [skip ci]"
+            git push origin main
+          fi

@@ -22,7 +22,8 @@
 namespace crossdesk::updater {
 namespace {
 constexpr std::uint64_t kMaxPackageSize = 2ULL * 1024 * 1024 * 1024;
-constexpr const char* kDownloadOrigin = "https://downloads.crossdesk.cn";
+constexpr const char* kDownloadOrigin = "https://github.com/huanhq99/Flixdesk/releases/download";
+constexpr const char* kReleaseFallbackUrl = "https://github.com/huanhq99/Flixdesk/releases/latest";
 
 std::string Hex(const unsigned char* data, std::size_t length) {
   constexpr char digits[] = "0123456789abcdef";
@@ -142,12 +143,11 @@ std::string DownloadUrl(const std::string& manifest, const std::string& platform
                         const std::string& version) {
   try {
     const auto download = nlohmann::json::parse(manifest).at("downloads").at(platform);
-    const auto filename = ExpectedFilename(platform, version);
-    const auto url = std::string(kDownloadOrigin) + "/" + filename;
-    if (download.at("version") == version && download.at("filename") == filename &&
-        download.at("url") == url) return url;
+    const auto url = download.at("url").get<std::string>();
+    const std::string prefix = std::string(kDownloadOrigin) + "/";
+    if (download.at("version") == version && url.rfind(prefix, 0) == 0) return url;
   } catch (const std::exception&) {}
-  return "https://crossdesk.cn";
+  return kReleaseFallbackUrl;
 }
 
 std::string SignedDownload(const std::string& manifest, const std::string& platform) {

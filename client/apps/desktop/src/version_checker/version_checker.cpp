@@ -107,76 +107,87 @@ void ConfigureLinuxCaCerts(httplib::Client* cli) {
 }  // namespace
 
 std::optional<VersionInfo> CheckUpdate() {
-  httplib::Client cli("https://version.crossdesk.cn");
+  struct Endpoint {
+    const char* origin;
+    const char* path;
+  };
+  const std::vector<Endpoint> endpoints = {
+      {"https://raw.githubusercontent.com", "/huanhq99/Flixdesk/main/version.json"},
+      {"https://cdn.jsdelivr.net", "/gh/huanhq99/Flixdesk@main/version.json"},
+  };
 
-  cli.set_connection_timeout(5);
-  cli.set_read_timeout(5);
-  cli.set_write_timeout(5);
-  cli.set_max_timeout(15000);
-  cli.set_follow_location(true);
+  for (const auto& endpoint : endpoints) {
+    httplib::Client cli(endpoint.origin);
+
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    cli.set_write_timeout(5);
+    cli.set_max_timeout(15000);
+    cli.set_follow_location(true);
 
 #if defined(CPPHTTPLIB_OPENSSL_SUPPORT) && defined(__linux__)
-  ConfigureLinuxCaCerts(&cli);
+    ConfigureLinuxCaCerts(&cli);
 #endif
 
-  auto res = cli.Get("/version.json");
-  if (res) {
-    if (res->status == 200) {
-      try {
-        const auto manifest = nlohmann::json::parse(res->body);
-        auto info = ParseVersionInfo(manifest);
-        if (info) {
+    auto res = cli.Get(endpoint.path);
+    if (!res) {
+      LogHttpError(res);
+      continue;
+    }
+    if (res->status != 200) {
+      LOG_WARN("Failed to fetch version.json from {}{}: HTTP status={}",
+               endpoint.origin, endpoint.path, res->status);
+      continue;
+    }
+
+    try {
+      const auto manifest = nlohmann::json::parse(res->body);
+      auto info = ParseVersionInfo(manifest);
+      if (info) {
 #if defined(__OHOS__)
-          // A Linux package cannot be installed by Harmony's package manager.
-          // Until the manifest has a Harmony artifact, use the release website.
-          info->download_url = "https://crossdesk.cn";
+        info->download_url = "https://github.com/huanhq99/Flixdesk/releases/latest";
 #elif defined(__linux__)
-          std::string architecture;
+        std::string architecture;
 #if defined(__x86_64__)
-          architecture = "amd64";
+        architecture = "amd64";
 #elif defined(__aarch64__)
-          architecture = "arm64";
+        architecture = "arm64";
 #endif
-          std::error_code error;
-          const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
-          info->download_url = LinuxUpdateDownloadUrl(
-              manifest, *info, architecture,
-              error ? std::filesystem::path{} : executable.parent_path());
+        std::error_code error;
+        const auto executable = std::filesystem::read_symlink("/proc/self/exe", error);
+        info->download_url = LinuxUpdateDownloadUrl(
+            manifest, *info, architecture,
+            error ? std::filesystem::path{} : executable.parent_path());
 #endif
 #ifndef __OHOS__
-          const auto platform = updater::PlatformKey(updater::ExecutablePath(),
+        const auto platform = updater::PlatformKey(updater::ExecutablePath(),
 #if CROSSDESK_PORTABLE
-                                                     true
+                                                   true
 #else
-                                                     false
+                                                   false
 #endif
-          );
+        );
 #if !defined(__linux__)
-          info->download_url = updater::DownloadUrl(manifest.dump(), platform, info->version);
+        info->download_url = updater::DownloadUrl(manifest.dump(), platform, info->version);
 #endif
 #if !CROSSDESK_PORTABLE
-          if (updater::DownloadUrl(manifest.dump(), platform, info->version) != "https://crossdesk.cn")
-            info->update_envelope = updater::SignedDownload(manifest.dump(), platform);
+        if (updater::DownloadUrl(manifest.dump(), platform, info->version) !=
+            "https://github.com/huanhq99/Flixdesk/releases/latest")
+          info->update_envelope = updater::SignedDownload(manifest.dump(), platform);
 #endif
 #endif
-          LOG_INFO("Fetched version.json: latest_version={}, releaseDate={}, patch={}",
-                   info->version, info->release_date, info->patch);
-        } else {
-          LOG_WARN("version.json does not contain a valid version");
-        }
-        return info;
-      } catch (const std::exception& e) {
-        LOG_WARN("Failed to parse version.json: {}", e.what());
-        return std::nullopt;
+        LOG_INFO("Fetched version.json from {}: latest_version={}, releaseDate={}, patch={}",
+                 endpoint.origin, info->version, info->release_date, info->patch);
+      } else {
+        LOG_WARN("version.json does not contain a valid version");
       }
-    } else {
-      LOG_WARN("Failed to fetch version.json: HTTP status={}", res->status);
-      return std::nullopt;
+      return info;
+    } catch (const std::exception& e) {
+      LOG_WARN("Failed to parse version.json: {}", e.what());
+      continue;
     }
-  } else {
-    LogHttpError(res);
-    return std::nullopt;
   }
+  return std::nullopt;
 }
 
 }  // namespace crossdesk
