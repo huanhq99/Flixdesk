@@ -19,9 +19,9 @@ export component SettingsButton inherits FlatSurface {
     callback clicked();
     width: 88px; height: 32px; border-radius: UiRadius.control;
     background: !root.enabled ? ControlStyle.disabled
-        : root.primary ? (touch.pressed ? #1e4fa3 : touch.has-hover ? #2866c9 : #3275dc)
-        : touch.pressed ? (root.destructive ? #f6babb : ButtonStyle.pressed)
-        : touch.has-hover ? (root.destructive ? #fbe0e0 : ButtonStyle.hover)
+        : root.primary ? (touch.pressed ? #0051d5 : touch.has-hover ? #0071e3 : #007aff)
+        : touch.pressed ? (root.destructive ? #ffd3d0 : ButtonStyle.pressed)
+        : touch.has-hover ? (root.destructive ? #ffe8e6 : ButtonStyle.hover)
         : root.quiet ? transparent : ButtonStyle.surface;
     outline-enabled: !root.quiet && !root.primary;
     outline-color: !root.enabled ? ButtonStyle.disabled-border
@@ -68,7 +68,7 @@ export component SettingsDialog inherits DialogSurface {
     out property <length> content-top: 64px;
     callback action();
     callback close();
-    background: #f8fafc;
+    background: #f5f5f7;
     outline-color: UiSurface.edge;
     TouchArea { }
     HorizontalLayout {
@@ -80,7 +80,7 @@ export component SettingsDialog inherits DialogSurface {
         }
         if root.badge-count > 0: Rectangle {
             width: max(24px, count-label.preferred-width + 14px); height: 22px;
-            border-radius: 11px; background: #e8efff;
+            border-radius: 11px; background: #e8f2ff;
             accessible-role: text; accessible-label: root.badge-label;
             count-label := Text {
                 text: "" + root.badge-count; color: WorkbenchStyle.accent;

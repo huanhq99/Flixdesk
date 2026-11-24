@@ -1,18 +1,18 @@
 import { FlatSurface, UiSurface } from "ui_surface.slint";
 import { UiRadius } from "ui_radius.slint";
 import { ControlStyle, ButtonStyle } from "common.slint";
-// Colors and spacing for the connection workbench; shapes are shared app-wide.
+// Flixdesk Apple HIG light-mode palette (macOS Sequoia).
 export global WorkbenchStyle {
-    out property <color> canvas: #edf2f8;
+    out property <color> canvas: #f5f5f7;
     out property <color> surface: #ffffff;
-    out property <color> field-surface: #f5f7fb;
+    out property <color> field-surface: #f2f2f7;
     out property <color> hover-surface: ControlStyle.hover;
     out property <color> pressed-surface: ControlStyle.pressed;
-    out property <color> separator: #e1e7ef;
-    out property <color> text: #1c2940;
-    out property <color> muted: #69788e;
-    out property <color> accent: #3564e3;
-    out property <color> success: #18835a;
+    out property <color> separator: #e5e5ea;
+    out property <color> text: #1d1d1f;
+    out property <color> muted: #86868b;
+    out property <color> accent: #007aff;
+    out property <color> success: #34c759;
 }
 
 export component WorkbenchButton inherits FlatSurface {
@@ -56,13 +56,13 @@ export component WorkbenchButton inherits FlatSurface {
         : touch.pressed ? ButtonStyle.pressed-border
         : touch.has-hover ? ButtonStyle.hover-border : root.normal-outline-color;
     background: root.destructive
-        ? (touch.pressed ? #912018 : touch.has-hover ? #b42318 : #d92d20)
+        ? (touch.pressed ? #b00010 : touch.has-hover ? #d70015 : #ff3b30)
         : root.soft
         ? (root.primary
-            ? (touch.pressed ? #254cc0 : touch.has-hover || root.show-focus ? WorkbenchStyle.accent : #dce7ff)
+            ? (touch.pressed ? #0051d5 : touch.has-hover || root.show-focus ? WorkbenchStyle.accent : #e8f2ff)
             : (touch.pressed ? ButtonStyle.pressed : touch.has-hover ? ButtonStyle.hover : ButtonStyle.surface))
         : root.primary
-        ? (touch.pressed ? #254cc0 : touch.has-hover ? #4574f0 : WorkbenchStyle.accent)
+        ? (touch.pressed ? #0051d5 : touch.has-hover ? #0071e3 : WorkbenchStyle.accent)
         : (touch.pressed ? root.pressed-background : touch.has-hover ? root.hover-background : root.quiet ? transparent : root.normal-background);
     opacity: root.enabled ? 1 : 0.45;
     animate background, outline-color { duration: 120ms; }
@@ -137,7 +137,7 @@ export component WorkbenchButton inherits FlatSurface {
         y: root.tooltip-above ? -self.height - 6px : root.height + 6px;
         width: min(260px, tip.preferred-width + 20px);
         height: max(28px, tip.preferred-height + 12px);
-        background: #24324a;
+        background: #1d1d1f;
         border-radius: UiRadius.control;
         z: 20;
         tip := Text {

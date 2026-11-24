@@ -1,0 +1,199 @@
+name: Build Flixdesk Desktop Client
+
+on:
+  workflow_dispatch:
+    inputs:
+      desktop_version:
+        description: "Desktop version (e.g. 1.7.7). Leave blank to use client/VERSION."
+        required: false
+        type: string
+      default_server_host:
+        description: "Optional default self-hosted server IP/domain to bake into the build (e.g. 140.210.12.140). Leave blank to keep default."
+        required: false
+        type: string
+      build_macos:
+        description: "Build macOS Apple Silicon (arm64) installer (.pkg)"
+        required: false
+        default: true
+        type: boolean
+      build_windows:
+        description: "Build Windows x64 installer (.exe)"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+env:
+  XMAKE_MIN_VERSION: "3.1.1"
+
+jobs:
+  prepare-version:
+    name: Resolve version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.desktop_version }}" ]]; then
+            BASE_VER="${{ inputs.desktop_version }}"
+          elif [[ -f client/VERSION ]]; then
+            BASE_VER="$(tr -d '[:space:]' < client/VERSION)"
+          else
+            BASE_VER="1.7.7"
+          fi
+          BASE_VER="${BASE_VER#v}"
+          TODAY="$(date -u +%Y%m%d)"
+          echo "version=v${BASE_VER}-${TODAY}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: v${BASE_VER}-${TODAY}"
+
+  build-macos-arm64:
+    name: Build macOS (Apple Silicon)
+    needs: prepare-version
+    if: ${{ inputs.build_macos != false }}
+    runs-on: macos-26
+    env:
+      VERSION_NUM: ${{ needs.prepare-version.outputs.version }}
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+      EXPECTED_MACOS_SDK: "26.5"
+    steps:
+      - name: Select Xcode 26.6
+        shell: bash
+        run: |
+          if [[ -d /Applications/Xcode_26.6.app/Contents/Developer ]]; then
+            sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          fi
+          xcodebuild -version
+          xcrun --sdk macosx --show-sdk-version
+
+      - name: Cache xmake dependencies
+        uses: actions/cache@v5
+        with:
+          path: ~/.xmake/packages
+          key: "${{ runner.os }}-xmake-deps-arm-macos26-${{ github.run_id }}"
+          restore-keys: |
+            ${{ runner.os }}-xmake-deps-arm-macos26-
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Optional bake default server host
+        if: ${{ inputs.default_server_host != '' }}
+        shell: bash
+        run: |
+          chmod +x scripts/set-default-server.sh
+          ./scripts/set-default-server.sh --host "${{ inputs.default_server_host }}"
+
+      - name: Ensure minimum Xmake version
+        uses: ./client/.github/actions/ensure-xmake
+        with:
+          minimum-version: ${{ env.XMAKE_MIN_VERSION }}
+
+      - name: Update xmake repositories
+        working-directory: client
+        run: xmake repo -u
+
+      - name: Build Flixdesk Desktop
+        working-directory: client
+        run: |
+          xmake f --target_minver=${MACOSX_DEPLOYMENT_TARGET} --CROSSDESK_VERSION=${VERSION_NUM} --USE_CUDA=false -vyD
+          xmake b -vy crossdesk
+
+      - name: Package macOS installer (.pkg)
+        working-directory: client
+        run: |
+          chmod +x ./apps/desktop/scripts/macos/pkg_arm64.sh
+          ./apps/desktop/scripts/macos/pkg_arm64.sh "${VERSION_NUM}"
+          cp "crossdesk-macos-arm64-${VERSION_NUM}.pkg" "flixdesk-macos-arm64-${VERSION_NUM}.pkg"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flixdesk-macos-arm64-${{ env.VERSION_NUM }}
+          path: client/flixdesk-macos-arm64-${{ env.VERSION_NUM }}.pkg
+          if-no-files-found: error
+
+  build-windows-x64:
+    name: Build Windows (x64)
+    needs: prepare-version
+    if: ${{ inputs.build_windows != false }}
+    runs-on: windows-2022
+    env:
+      VERSION_NUM: ${{ needs.prepare-version.outputs.version }}
+      XMAKE_GLOBALDIR: D:\xmake_global
+    steps:
+      - name: Cache xmake dependencies
+        uses: actions/cache@v5
+        with:
+          path: D:\xmake_global\.xmake\packages
+          key: "${{ runner.os }}-xmake-deps-x64-${{ github.run_id }}"
+          restore-keys: |
+            ${{ runner.os }}-xmake-deps-x64-
+
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Optional bake default server host
+        if: ${{ inputs.default_server_host != '' }}
+        shell: bash
+        run: |
+          chmod +x scripts/set-default-server.sh
+          ./scripts/set-default-server.sh --host "${{ inputs.default_server_host }}"
+
+      - name: Ensure minimum Xmake version
+        uses: ./client/.github/actions/ensure-xmake
+        with:
+          minimum-version: ${{ env.XMAKE_MIN_VERSION }}
+
+      - name: Update xmake repositories
+        working-directory: client
+        run: xmake repo -u
+
+      - name: Download INetC plugin
+        shell: powershell
+        run: |
+          $url = "https://github.com/DigitalMediaServer/NSIS-INetC-plugin/releases/download/v1.0.5.7/InetC.zip"
+          $out = "$env:RUNNER_TEMP\InetC.zip"
+          Invoke-WebRequest -Uri $url -OutFile $out
+          Expand-Archive $out -DestinationPath "$env:RUNNER_TEMP\InetC" -Force
+          $source = "$env:RUNNER_TEMP\InetC\x86-unicode\INetC.dll"
+          $target = "C:\Program Files (x86)\NSIS\Plugins\x86-unicode\INetC.dll"
+          Copy-Item $source $target -Force
+
+      - name: Copy nsProcess plugin to NSIS folder
+        shell: powershell
+        run: |
+          $nsisPluginDir = "C:\Program Files (x86)\NSIS\Plugins\x86-unicode"
+          Copy-Item "${{ github.workspace }}\client\apps\desktop\scripts\windows\nsProcess.dll" $nsisPluginDir -Force
+
+      - name: Build Flixdesk Desktop
+        working-directory: client
+        run: |
+          xmake f --CROSSDESK_VERSION=${{ env.VERSION_NUM }} --USE_CUDA=false -y
+          xmake b -vy crossdesk
+
+      - name: Package Windows installer (.exe)
+        working-directory: client
+        shell: pwsh
+        run: |
+          & "${{ github.workspace }}\client\apps\desktop\scripts\windows\pkg_x64.ps1" $env:VERSION_NUM
+          $src = "${{ github.workspace }}\client\apps\desktop\scripts\windows\crossdesk-win-x64-$env:VERSION_NUM.exe"
+          $dst = "${{ github.workspace }}\client\apps\desktop\scripts\windows\flixdesk-win-x64-$env:VERSION_NUM.exe"
+          Copy-Item $src $dst -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flixdesk-win-x64-${{ env.VERSION_NUM }}
+          path: client/apps/desktop/scripts/windows/flixdesk-win-x64-${{ env.VERSION_NUM }}.exe
+          if-no-files-found: error

@@ -495,7 +495,7 @@ export component GalleryView inherits Rectangle {
             if root.batch && !root.simplified: FlatSurface {
                 x: parent.width - 27px; y: parent.height - 27px;
                 width: 18px; height: 18px; border-radius: 4px;
-                background: tile.selected ? (tile-touch.pressed ? #254cc0 : tile-touch.has-hover ? #4574f0 : #3564e3)
+                background: tile.selected ? (tile-touch.pressed ? #0051a8 : tile-touch.has-hover ? #0071e3 : #007aff)
                     : tile-touch.pressed ? ControlStyle.pressed : tile-touch.has-hover ? ControlStyle.hover : ControlStyle.surface;
                 outline-color: tile.selected ? UiSurface.focus : tile-touch.has-hover ? UiSurface.hover : UiSurface.edge;
                 animate background, outline-color { duration: 120ms; }

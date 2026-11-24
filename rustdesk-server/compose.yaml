@@ -1,8 +1,0 @@
-services:
-  flixdesk:
-    image: huanhq99/flixdesk-rustdesk:latest
-    container_name: flixdesk_rustdesk
-    network_mode: host
-    restart: unless-stopped
-    volumes:
-      - ./data:/data

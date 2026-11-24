@@ -54,37 +54,37 @@ export global FloatingBarStyle {
     out property <length> corner-radius: UiRadius.menu;
 }
 
-// Fields and selection controls share a muted fill.
+// Apple HIG neutral control fills & systemBlue accents.
 export global ControlStyle {
-    out property <color> surface: #dce6f3;
-    out property <color> hover: #cedef1;
-    out property <color> pressed: #bfd2ec;
-    out property <color> selected: #bcd4f7;
-    out property <color> selected-hover: #adcaf1;
-    out property <color> selected-pressed: #99bce8;
-    out property <color> selected-text: #1d4e9e;
-    out property <color> disabled: #f0f2f5;
-    out property <color> icon: #52657f;
-    out property <color> input-surface: #dee7f2;
-    out property <color> input-focused: #e5ecf5;
-    out property <color> input-placeholder: #566a84;
+    out property <color> surface: #f2f2f7;
+    out property <color> hover: #e5e5ea;
+    out property <color> pressed: #d1d1d6;
+    out property <color> selected: #e3f0ff;
+    out property <color> selected-hover: #d4e8ff;
+    out property <color> selected-pressed: #c2dfff;
+    out property <color> selected-text: #007aff;
+    out property <color> disabled: #f5f5f7;
+    out property <color> icon: #6e6e73;
+    out property <color> input-surface: #f2f2f7;
+    out property <color> input-focused: #ffffff;
+    out property <color> input-placeholder: #8e8e93;
     // These tints over white match the field fills for standard LineEdit.
-    out property <color> input-tint: #235eaa26;
-    out property <color> input-focus-tint: #235eaa1e;
+    out property <color> input-tint: #007aff12;
+    out property <color> input-focus-tint: #007aff1c;
 }
 
-// Action buttons use a light surface and a crisp edge, distinct from fields.
+// Action buttons use crisp white surfaces with Apple hairline borders.
 export global ButtonStyle {
     out property <color> surface: #ffffff;
-    out property <color> hover: #f0f5ff;
-    out property <color> pressed: #dfe9fa;
-    out property <color> border: #b8c7db;
-    out property <color> hover-border: #7e9fd1;
-    out property <color> pressed-border: #6488bf;
-    out property <color> disabled-border: #dce2eb;
-    out property <color> selected: #3564e3;
-    out property <color> selected-hover: #4574f0;
-    out property <color> selected-pressed: #254cc0;
+    out property <color> hover: #f5f5f7;
+    out property <color> pressed: #e5e5ea;
+    out property <color> border: #d1d1d6;
+    out property <color> hover-border: #aeaeb2;
+    out property <color> pressed-border: #8e8e93;
+    out property <color> disabled-border: #e5e5ea;
+    out property <color> selected: #007aff;
+    out property <color> selected-hover: #0071e3;
+    out property <color> selected-pressed: #0051d5;
 }
 
 // ImGui loads a 32px font atlas and applies per-window font scales. These
@@ -427,10 +427,10 @@ export component ImGuiCheckBox inherits FlatSurface {
     width: 21px;
     height: 21px;
     background: !root.enabled ? ControlStyle.disabled
-        : root.checked ? (check-touch.pressed ? #254cc0 : check-touch.has-hover ? #4574f0 : #3564e3)
+        : root.checked ? (check-touch.pressed ? #0051a8 : check-touch.has-hover ? #0071e3 : #007aff)
         : check-touch.pressed ? ControlStyle.pressed : check-touch.has-hover ? ControlStyle.hover : ControlStyle.surface;
     outline-color: check-touch.has-hover && root.enabled ? UiSurface.focus : UiSurface.edge;
-    border-radius: 4px;
+    border-radius: 5px;
     if root.checked: Text {
         text: FontAwesomeIcons.check;
         color: root.enabled ? white : #8b8f95;
@@ -453,8 +453,8 @@ export component MiniToggleSwitch inherits Rectangle {
 
     width: 29px;
     height: 16px;
-    background: !root.enabled ? (root.checked ? #6e9ddacc : #9a9a9acc)
-              : root.checked ? #2463c7 : #9a9a9a;
+    background: !root.enabled ? (root.checked ? #80bdffcc : #d1d1d6cc)
+              : root.checked ? #007aff : #c7c7cc;
     border-radius: 8px;
     Rectangle {
         x: root.checked ? parent.width - self.width - 2px : 2px;
@@ -510,10 +510,10 @@ export component PrimaryButton inherits FlatSurface {
 
     min-width: 72px;
     height: 32px;
-    background: !root.enabled ? #b8c1d1
-              : touch.pressed ? #254cc0
-              : touch.has-hover ? #4574f0
-              : #3564e3;
+    background: !root.enabled ? #c7c7cc
+              : touch.pressed ? #0051a8
+              : touch.has-hover ? #0071e3
+              : #007aff;
     outline-enabled: false;
     border-radius: UiRadius.control;
     animate background { duration: 100ms; }
@@ -575,7 +575,7 @@ export component ToggleSwitch inherits Rectangle {
 
     width: 36px;
     height: 20px;
-    background: !root.enabled ? #d0d5dd : root.checked ? #2463c7 : #98a2b3;
+    background: !root.enabled ? #e5e5ea : root.checked ? #007aff : #d1d1d6;
     border-radius: self.height / 2;
 
     Rectangle {

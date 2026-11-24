@@ -338,7 +338,7 @@ component PasswordInput inherits FlatSurface {
         font-size: root.text-size;
         vertical-alignment: center;
         selection-foreground-color: white;
-        selection-background-color: #2463c7;
+        selection-background-color: #007aff;
         edited => {
             // Validate the resulting text so typing, paste, and replacement
             // all obey the limit while deletion and selection still work.
@@ -365,7 +365,7 @@ component PasswordInput inherits FlatSurface {
 
 export component MainWindow inherits Window {
     title: root.window-title;
-    out property <string> window-title: root.gallery-mode ? "CrossDesk " + GalleryStrings.texts[54] : "CrossDesk";
+    out property <string> window-title: root.gallery-mode ? "Flixdesk " + GalleryStrings.texts[54] : "Flixdesk";
     icon: @image-url("../../../resources/linux/crossdesk_256x256.png");
     preferred-width: root.minimum-window-width;
     preferred-height: root.minimum-window-height;
@@ -3443,7 +3443,7 @@ export component MainWindow inherits Window {
                                     version-link := Text {
                                         width: parent.width; height: parent.height;
                                         text: UiStrings.update-available + ": " + root.latest-version;
-                                        color: version-touch.has-hover ? #254cc0 : WorkbenchStyle.accent;
+                                        color: version-touch.has-hover ? #0051a8 : WorkbenchStyle.accent;
                                         font-size: 13px; font-weight: 500; wrap: word-wrap;
                                         vertical-alignment: center;
                                     }
@@ -3578,7 +3578,7 @@ export component MainWindow inherits Window {
                             accessible-action-default => { root.open-website(); }
                             update-website-label := Text {
                                 text: UiStrings.access-website + "https://crossdesk.cn";
-                                color: website-touch.has-hover ? #254cc0 : WorkbenchStyle.accent;
+                                color: website-touch.has-hover ? #0051a8 : WorkbenchStyle.accent;
                                 font-size: 13px;
                                 vertical-alignment: center;
                             }
