@@ -1,6 +1,6 @@
 services:
   flixdesk:
-    image: "${CROSSDESK_IMAGE:-ghcr.io/huanhq99/flixdesk-server:latest}"
+    image: "${CROSSDESK_IMAGE:-huanhq99/flixdesk-server:latest}"
     container_name: flixdesk_server
     network_mode: host
     restart: unless-stopped

@@ -38,7 +38,7 @@ Flixdesk/
 ```yaml
 services:
   flixdesk:
-    image: ghcr.io/huanhq99/flixdesk-server:latest
+    image: huanhq99/flixdesk-server:latest
     container_name: flixdesk_server
     network_mode: host
     restart: unless-stopped
@@ -46,6 +46,8 @@ services:
       - ./data:/var/lib/crossdesk
       - ./logs:/var/log/crossdesk
 ```
+
+> 镜像同时发布到 **Docker Hub**（`huanhq99/flixdesk-server:latest`，国内服务器可直接配合 Docker 加速源秒拉）与 **GHCR**（`ghcr.io/huanhq99/flixdesk-server:latest`）。
 
 ### 3. 打开 Web 配置面板完成设置
 

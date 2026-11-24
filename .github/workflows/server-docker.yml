@@ -35,7 +35,8 @@ jobs:
           COTURN_STATELESS_NONCE_SECRET: ci-validation-only-not-for-production
         run: |
           bash -n docker/start.sh docker/generate_certs.sh
-          docker compose --env-file .env.example config --quiet
+          python3 -m py_compile panel/panel.py
+          docker compose config --quiet
 
   build:
     runs-on: ${{ matrix.runner }}
@@ -144,18 +145,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Login to Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'huanhq99' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       - name: Compute image tags
         id: meta
         shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          IMAGE="ghcr.io/${OWNER}/flixdesk-server"
+          GHCR_IMAGE="ghcr.io/${OWNER}/flixdesk-server"
+          DH_USER="${DOCKERHUB_USERNAME:-huanhq99}"
+          DH_IMAGE="${DH_USER}/flixdesk-server"
+
+          TAGS="${GHCR_IMAGE}:latest-${{ matrix.arch }}"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF_NAME}"
-            echo "tags=${IMAGE}:${TAG}-${{ matrix.arch }},${IMAGE}:latest-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tags=${IMAGE}:latest-${{ matrix.arch }}" >> "$GITHUB_OUTPUT"
+            TAGS="${TAGS},${GHCR_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
           fi
+          if [[ "${HAS_DOCKERHUB}" == "true" ]]; then
+            TAGS="${TAGS},${DH_IMAGE}:latest-${{ matrix.arch }}"
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              TAGS="${TAGS},${DH_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
+            fi
+          fi
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push ${{ matrix.arch }} image
         uses: docker/build-push-action@v6
@@ -184,20 +203,40 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish multi-arch manifest
+      - name: Login to Docker Hub
+        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || 'huanhq99' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publish multi-arch manifests
         shell: bash
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
-          IMAGE="ghcr.io/${OWNER}/flixdesk-server"
+          GHCR_IMAGE="ghcr.io/${OWNER}/flixdesk-server"
+          DH_USER="${DOCKERHUB_USERNAME:-huanhq99}"
+          DH_IMAGE="${DH_USER}/flixdesk-server"
 
-          docker buildx imagetools create \
-            -t "${IMAGE}:latest" \
-            "${IMAGE}:latest-amd64" \
-            "${IMAGE}:latest-arm64"
-
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+          publish_manifest() {
+            local IMG="$1"
             docker buildx imagetools create \
-              -t "${IMAGE}:${GITHUB_REF_NAME}" \
-              "${IMAGE}:${GITHUB_REF_NAME}-amd64" \
-              "${IMAGE}:${GITHUB_REF_NAME}-arm64"
+              -t "${IMG}:latest" \
+              "${IMG}:latest-amd64" \
+              "${IMG}:latest-arm64"
+
+            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+              docker buildx imagetools create \
+                -t "${IMG}:${GITHUB_REF_NAME}" \
+                "${IMG}:${GITHUB_REF_NAME}-amd64" \
+                "${IMG}:${GITHUB_REF_NAME}-arm64"
+            fi
+          }
+
+          publish_manifest "${GHCR_IMAGE}"
+          if [[ "${HAS_DOCKERHUB}" == "true" ]]; then
+            publish_manifest "${DH_IMAGE}"
           fi
