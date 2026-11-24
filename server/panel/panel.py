@@ -313,15 +313,13 @@ class ServiceSupervisor:
                 "--no-stdout-log",
                 "--new-log-timestamp",
                 "--no-multicast-peers",
-                "--proc-user=nobody",
-                "--proc-group=nogroup",
             ]
-            if "--dtls" in turn_help:
+            if "--no-cli" in turn_help:
+                turn_cmd.append("--no-cli")
+            if "--dtls " in turn_help or "--dtls\n" in turn_help:
                 turn_cmd.append("--dtls")
             if "--stateless-nonce-secret" in turn_help and cfg.get("coturn_stateless_nonce_secret"):
                 turn_cmd.append(f"--stateless-nonce-secret={cfg['coturn_stateless_nonce_secret']}")
-            if "--cli" in turn_help:
-                turn_cmd.append("--cli=false")
 
             try:
                 self.coturn_proc = subprocess.Popen(
