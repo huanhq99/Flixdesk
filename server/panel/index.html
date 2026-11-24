@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flixdesk 服务端配置面板</title>
+  <style>
+    :root {
+      --bg: #0f172a; --card: #1e293b; --border: #334155;
+      --text: #f1f5f9; --muted: #94a3b8; --primary: #3b82f6;
+      --primary-hover: #2563eb; --ok: #22c55e; --err: #ef4444; --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+    .container { max-width: 960px; margin: 0 auto; padding: 24px 16px 64px; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 12px; }
+    h1 { margin: 0; font-size: 22px; display: flex; align-items: center; gap: 10px; }
+    .badge { font-size: 12px; padding: 3px 10px; border-radius: 999px; font-weight: 600; }
+    .badge.ok { background: rgba(34,197,94,.18); color: #4ade80; }
+    .badge.err { background: rgba(239,68,68,.18); color: #f87171; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 18px; }
+    .card h2 { margin: 0 0 14px; font-size: 16px; border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+    label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
+    input, textarea { width: 100%; background: #0f172a; border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; color: var(--text); font-size: 14px; font-family: inherit; }
+    textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; min-height: 110px; }
+    input:focus, textarea:focus { outline: none; border-color: var(--primary); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+    button, .btn { background: var(--primary); color: #fff; border: none; border-radius: 8px; padding: 9px 16px; font-size: 14px; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; font-weight: 500; }
+    button:hover, .btn:hover { background: var(--primary-hover); }
+    button.secondary, .btn.secondary { background: #334155; }
+    button.secondary:hover, .btn.secondary:hover { background: #475569; }
+    button.danger { background: #b91c1c; }
+    button.danger:hover { background: #991b1b; }
+    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+    .stat { background: #0f172a; border: 1px solid var(--border); border-radius: 8px; padding: 12px; }
+    .stat .k { font-size: 12px; color: var(--muted); }
+    .stat .v { font-size: 15px; font-weight: 600; margin-top: 4px; }
+    pre.logs { background: #020617; border: 1px solid var(--border); border-radius: 8px; padding: 12px; max-height: 280px; overflow: auto; font-size: 12px; color: #cbd5e1; white-space: pre-wrap; margin: 0; }
+    .toast { position: fixed; right: 20px; bottom: 20px; background: #1e293b; border: 1px solid var(--primary); padding: 12px 18px; border-radius: 10px; display: none; box-shadow: 0 10px 30px rgba(0,0,0,.4); z-index: 99; }
+    .auth-box { max-width: 400px; margin: 90px auto; }
+    .hint { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Auth / First Setup -->
+    <div id="authView" class="card auth-box hidden">
+      <h2 id="authTitle">初始化 Flixdesk 配置面板</h2>
+      <p class="hint" id="authDesc">首次使用请设置一个面板管理密码（至少 6 位），用于保护服务器配置。</p>
+      <label>管理密码</label>
+      <input type="password" id="authPassword" placeholder="输入密码" />
+      <div class="row">
+        <button id="authSubmitBtn" onclick="submitAuth()">进入面板</button>
+      </div>
+    </div>
+
+    <!-- Main Dashboard -->
+    <div id="mainView" class="hidden">
+      <header>
+        <h1>
+          Flixdesk 服务端控制台
+          <span id="overallBadge" class="badge err">检查中</span>
+        </h1>
+        <div class="row" style="margin:0;">
+          <a id="adminLink" class="btn secondary" href="#" target="_blank">打开 /admin 监控后台 ↗</a>
+          <button class="secondary" onclick="logout()">退出登录</button>
+        </div>
+      </header>
+
+      <div class="card">
+        <h2>运行状态</h2>
+        <div class="status-grid">
+          <div class="stat"><div class="k">信令服务 (crossdesk_server)</div><div class="v" id="stServer">-</div></div>
+          <div class="stat"><div class="k">中继服务 (Coturn)</div><div class="v" id="stCoturn">-</div></div>
+          <div class="stat"><div class="k">TLS 证书状态</div><div class="v" id="stCert">-</div></div>
+          <div class="stat"><div class="k">客户端连接地址</div><div class="v" id="stEndpoint">-</div></div>
+        </div>
+        <div id="lastError" class="hint" style="color:#f87171;margin-top:10px;"></div>
+        <div class="row">
+          <button onclick="serviceAction('restart')">启动 / 重启服务</button>
+          <button class="danger" onclick="serviceAction('stop')">停止服务</button>
+          <button class="secondary" onclick="refreshAll()">刷新状态</button>
+          <a id="downloadRootBtn" class="btn secondary hidden" href="/api/certs/root.crt">下载自签根证书 (.crt)</a>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>基础网络与后台配置</h2>
+        <div class="grid">
+          <div>
+            <label>公网 IP (EXTERNAL_IP)</label>
+            <input id="external_ip" placeholder="例如 140.210.12.140" />
+          </div>
+          <div>
+            <label>本机内网绑定 IP (INTERNAL_IP)</label>
+            <input id="internal_ip" placeholder="例如 10.0.0.5" />
+          </div>
+          <div>
+            <label>对外域名 (可选，COTURN_PUBLIC_HOST)</label>
+            <input id="public_host" placeholder="留空则默认使用公网 IP" />
+          </div>
+          <div>
+            <label>信令服务端口 (TCP)</label>
+            <input id="server_port" type="number" value="9099" />
+          </div>
+          <div>
+            <label>STUN/TURN 端口 (TCP/UDP)</label>
+            <input id="coturn_port" type="number" value="3478" />
+          </div>
+          <div>
+            <label>TURN 媒体端口范围 (UDP)</label>
+            <div style="display:flex;gap:8px;">
+              <input id="min_port" type="number" value="50000" />
+              <input id="max_port" type="number" value="60000" />
+            </div>
+          </div>
+          <div>
+            <label>/admin 监控后台用户名（可选）</label>
+            <input id="admin_username" placeholder="留空则关闭 /admin" />
+          </div>
+          <div>
+            <label>/admin 监控后台密码（可选）</label>
+            <input id="admin_password" type="password" placeholder="与用户名同时填写生效" />
+          </div>
+        </div>
+        <div class="row">
+          <button onclick="saveConfig()">保存配置并重启服务</button>
+          <button class="secondary" onclick="detectIp()">自动探测服务器 IP</button>
+          <button class="secondary" onclick="regenCert()">重新生成自签证书</button>
+        </div>
+        <p class="hint">请确保服务器防火墙与安全组已放行：9098/TCP（本配置面板）、信令端口/TCP、3478 TCP+UDP、50000-60000/UDP。</p>
+      </div>
+
+      <div class="card">
+        <h2>自定义域名 SSL 证书（可选）</h2>
+        <p class="hint" style="margin-top:0;">如果你使用自己的域名，粘贴 PEM 格式的证书链（fullchain）和私钥即可，客户端无需手动导入根证书。</p>
+        <div class="grid">
+          <div>
+            <label>证书链 (PEM / fullchain.crt)</label>
+            <textarea id="certPem" placeholder="-----BEGIN CERTIFICATE-----"></textarea>
+          </div>
+          <div>
+            <label>私钥 (PEM / privkey.key)</label>
+            <textarea id="keyPem" placeholder="-----BEGIN PRIVATE KEY-----"></textarea>
+          </div>
+        </div>
+        <div class="row">
+          <button onclick="uploadCert()">保存自定义证书并重载</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>实时日志</h2>
+        <pre id="logsBox" class="logs">加载中...</pre>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    let authMode = 'login';
+    function toast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.style.display = 'block';
+      setTimeout(() => t.style.display = 'none', 3200);
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, {
+        headers: { 'Content-Type': 'application/json' },
+        ...opts,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || data.message || ('HTTP ' + res.status));
+      return data;
+    }
+
+    async function init() {
+      const state = await api('/api/auth/state');
+      if (!state.initialized) {
+        authMode = 'setup';
+        document.getElementById('authTitle').textContent = '初始化 Flixdesk 配置面板';
+        document.getElementById('authDesc').textContent = '首次使用请设置一个面板管理密码（至少 6 位），设置后即可在网页中配置服务器。';
+        document.getElementById('authSubmitBtn').textContent = '设置密码并进入';
+        document.getElementById('authView').classList.remove('hidden');
+      } else if (!state.authenticated) {
+        authMode = 'login';
+        document.getElementById('authTitle').textContent = '登录 Flixdesk 配置面板';
+        document.getElementById('authDesc').textContent = '请输入你设置的面板管理密码。';
+        document.getElementById('authSubmitBtn').textContent = '登录';
+        document.getElementById('authView').classList.remove('hidden');
+      } else {
+        document.getElementById('authView').classList.add('hidden');
+        document.getElementById('mainView').classList.remove('hidden');
+        await refreshAll();
+      }
+    }
+
+    async function submitAuth() {
+      const password = document.getElementById('authPassword').value;
+      try {
+        await api(authMode === 'setup' ? '/api/auth/setup' : '/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ password }),
+        });
+        location.reload();
+      } catch (e) { toast(e.message); }
+    }
+
+    async function logout() {
+      await api('/api/auth/logout', { method: 'POST', body: '{}' });
+      location.reload();
+    }
+
+    async function refreshAll() {
+      const [st, cfg, lg] = await Promise.all([
+        api('/api/status'),
+        api('/api/config'),
+        api('/api/logs'),
+      ]);
+      const ok = st.server_running && st.coturn_running;
+      const badge = document.getElementById('overallBadge');
+      badge.textContent = ok ? '运行中' : (st.server_running ? '部分运行' : '未启动');
+      badge.className = 'badge ' + (ok ? 'ok' : 'err');
+      document.getElementById('stServer').textContent = st.server_running ? `运行中 (PID ${st.server_pid})` : '已停止';
+      document.getElementById('stCoturn').textContent = st.coturn_running ? `运行中 (PID ${st.coturn_pid})` : '已停止';
+      document.getElementById('stCert').textContent = st.has_certs ? '已就绪' : '未生成';
+      const host = cfg.public_host || cfg.external_ip || location.hostname;
+      document.getElementById('stEndpoint').textContent = `${host}:${cfg.server_port}`;
+      document.getElementById('adminLink').href = `https://${host}:${cfg.server_port}/admin`;
+      document.getElementById('lastError').textContent = st.last_error || '';
+      document.getElementById('downloadRootBtn').classList.toggle('hidden', !st.has_root_cert);
+
+      ['external_ip','internal_ip','public_host','server_port','coturn_port','min_port','max_port','admin_username','admin_password'].forEach(k => {
+        const el = document.getElementById(k);
+        if (el && cfg[k] !== undefined) el.value = cfg[k];
+      });
+      document.getElementById('logsBox').textContent = (lg.lines || []).join('\n') || '暂无日志';
+    }
+
+    async function saveConfig() {
+      const payload = { restart: true };
+      ['external_ip','internal_ip','public_host','server_port','coturn_port','min_port','max_port','admin_username','admin_password'].forEach(k => {
+        payload[k] = document.getElementById(k).value;
+      });
+      try {
+        const res = await api('/api/config', { method: 'POST', body: JSON.stringify(payload) });
+        toast(res.message || '保存成功');
+        setTimeout(refreshAll, 800);
+      } catch (e) { toast(e.message); }
+    }
+
+    async function detectIp() {
+      try {
+        const d = await api('/api/detect-ip', { method: 'POST', body: '{}' });
+        if (d.external_ip) document.getElementById('external_ip').value = d.external_ip;
+        if (d.internal_ip) document.getElementById('internal_ip').value = d.internal_ip;
+        toast('已自动探测 IP，请核对后点击保存');
+      } catch (e) { toast(e.message); }
+    }
+
+    async function regenCert() {
+      try {
+        const res = await api('/api/certs/generate', { method: 'POST', body: '{}' });
+        toast(res.message || '证书已重新生成');
+        setTimeout(refreshAll, 800);
+      } catch (e) { toast(e.message); }
+    }
+
+    async function uploadCert() {
+      try {
+        const res = await api('/api/certs/upload', {
+          method: 'POST',
+          body: JSON.stringify({
+            cert: document.getElementById('certPem').value,
+            key: document.getElementById('keyPem').value,
+          }),
+        });
+        toast(res.message || '证书已保存');
+        setTimeout(refreshAll, 800);
+      } catch (e) { toast(e.message); }
+    }
+
+    async function serviceAction(act) {
+      try {
+        const res = await api('/api/service/' + act, { method: 'POST', body: '{}' });
+        toast(res.message || '操作完成');
+        setTimeout(refreshAll, 800);
+      } catch (e) { toast(e.message); }
+    }
+
+    document.getElementById('authPassword').addEventListener('keydown', e => {
+      if (e.key === 'Enter') submitAuth();
+    });
+    init();
+  </script>
+</body>
+</html>

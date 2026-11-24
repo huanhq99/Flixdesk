@@ -24,45 +24,44 @@ Flixdesk/
 ## 一、部署自己的服务端（Linux + Docker Compose）
 
 ### 1. 准备工作
-- 一台拥有公网 IP 的 Linux 服务器（推荐 Ubuntu 22.04+），已安装 Docker 与 Docker Compose。
+- 一台拥有公网 IP 的 Linux 服务器（支持 `amd64` / `arm64`），已安装 Docker（支持 1Panel / Portainer / 命令行）。
 - 在云服务器安全组和防火墙放行以下端口：
-  - `9099/TCP`：WSS 信令、HTTPS 接口及 Web 管理后台
+  - `9098/TCP`：Flixdesk Web 配置面板（首次初始化、改 IP/域名、上传证书、启停服务、看日志）
+  - `9099/TCP`：WSS 信令、HTTPS 接口及 `/admin` 监控后台
   - `3478/TCP` & `3478/UDP`：STUN / TURN 服务
   - `50000–60000/UDP`：TURN 媒体中继端口
 
-### 2. 生成服务端配置文件
+### 2. 零 `.env` 一键 Docker Compose 部署（推荐，直接适配 1Panel）
 
-在仓库根目录执行：
+**无需手写 `.env`，无需手动生成密钥**，直接在 1Panel「容器 → 编排」或服务器 `docker-compose.yml` 中粘贴以下内容并启动：
 
-```bash
-./scripts/init-server-env.sh --external-ip <你的公网IP> --internal-ip <本机内网IP>
+```yaml
+services:
+  flixdesk:
+    image: ghcr.io/huanhq99/flixdesk-server:latest
+    container_name: flixdesk_server
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./data:/var/lib/crossdesk
+      - ./logs:/var/log/crossdesk
 ```
 
-可选参数：
-- `--domain <你的域名>`：写入 `COTURN_PUBLIC_HOST`（使用自有域名时建议配置）
-- `--port <端口>`：信令服务端口，默认 `9099`
-- `--admin-user <用户名> --admin-pass <密码>`：启用 `/admin` Web 管理后台
+### 3. 打开 Web 配置面板完成设置
 
-脚本会自动调用 `openssl rand -hex 32` 生成 `COTURN_AUTH_SECRET` 与 `COTURN_STATELESS_NONCE_SECRET` 并写入 `server/.env`（已被 `.gitignore` 忽略，不会提交到 Git）。
+容器启动后，在浏览器打开：
 
-### 3. 启动服务端（GitHub Container Registry 镜像部署）
-
-本仓库已配置 GitHub Actions（`.github/workflows/server-docker.yml`），使用 GitHub 内置 `GITHUB_TOKEN` 自动编译 `linux/amd64` 与 `linux/arm64` 服务端并推送到 `ghcr.io/huanhq99/flixdesk-server:latest`，无需配置任何第三方 Token。
-
-在服务器上直接拉取并启动即可（无需在服务器编译 C++）：
-
-```bash
-cd server
-docker compose pull
-docker compose up -d --no-build
-
-# 查看运行状态
-docker compose ps
+```text
+http://<你的服务器IP>:9098
 ```
 
-### 4. 访问内置 Web 管理面板
+1. **首次访问**：设置一个面板登录密码（至少 6 位）；
+2. **自动初始化**：面板会自动探测服务器公网/内网 IP 并自动生成 Coturn 密钥；
+3. **可视化配置**：在网页里即可修改公网 IP / 域名、端口、`/admin` 监控后台账号密码、一键下载自签根证书或粘贴自己的域名 SSL 证书，点击**「保存配置并重启服务」**立即生效。
 
-只要在生成 `.env` 时传入了 `--admin-user` 和 `--admin-pass`（或手动在 `server/.env` 中同时填写 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 后重启容器），即可在浏览器访问内置管理后台：
+### 4. 访问内置 `/admin` 监控后台
+
+在 Web 配置面板（9098）中填好 `/admin` 用户名和密码并保存重启后，即可访问：
 
 ```text
 https://<你的服务器IP或域名>:9099/admin
