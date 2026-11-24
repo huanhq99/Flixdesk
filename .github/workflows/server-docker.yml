@@ -146,7 +146,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME || 'huanhq99' }}
@@ -157,22 +156,15 @@ jobs:
         shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           GHCR_IMAGE="ghcr.io/${OWNER}/flixdesk-server"
           DH_USER="${DOCKERHUB_USERNAME:-huanhq99}"
           DH_IMAGE="${DH_USER}/flixdesk-server"
 
-          TAGS="${GHCR_IMAGE}:latest-${{ matrix.arch }}"
+          TAGS="${GHCR_IMAGE}:latest-${{ matrix.arch }},${DH_IMAGE}:latest-${{ matrix.arch }}"
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAGS="${TAGS},${GHCR_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
-          fi
-          if [[ "${HAS_DOCKERHUB}" == "true" ]]; then
-            TAGS="${TAGS},${DH_IMAGE}:latest-${{ matrix.arch }}"
-            if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-              TAGS="${TAGS},${DH_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
-            fi
+            TAGS="${TAGS},${GHCR_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }},${DH_IMAGE}:${GITHUB_REF_NAME}-${{ matrix.arch }}"
           fi
           echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
 
@@ -204,7 +196,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to Docker Hub
-        if: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME || 'huanhq99' }}
@@ -214,7 +205,6 @@ jobs:
         shell: bash
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          HAS_DOCKERHUB: ${{ secrets.DOCKERHUB_TOKEN != '' }}
         run: |
           OWNER="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
           GHCR_IMAGE="ghcr.io/${OWNER}/flixdesk-server"
@@ -237,6 +227,4 @@ jobs:
           }
 
           publish_manifest "${GHCR_IMAGE}"
-          if [[ "${HAS_DOCKERHUB}" == "true" ]]; then
-            publish_manifest "${DH_IMAGE}"
-          fi
+          publish_manifest "${DH_IMAGE}"
