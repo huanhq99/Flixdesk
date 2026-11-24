@@ -45,11 +45,11 @@ Flixdesk/
 
 脚本会自动调用 `openssl rand -hex 32` 生成 `COTURN_AUTH_SECRET` 与 `COTURN_STATELESS_NONCE_SECRET` 并写入 `server/.env`（已被 `.gitignore` 忽略，不会提交到 Git）。
 
-### 3. 启动服务端（Docker Hub 镜像部署）
+### 3. 启动服务端（GitHub Container Registry 镜像部署）
 
-本仓库已配置 GitHub Actions（`.github/workflows/server-docker.yml`），会自动编译 `linux/amd64` 与 `linux/arm64` 服务端并推送到 Docker Hub 镜像 `huanhq99/flixdesk-server:latest`（需在 GitHub 仓库的 **Settings → Secrets → Actions** 中配置 `DOCKERHUB_USERNAME` 和 `DOCKERHUB_TOKEN`）。
+本仓库已配置 GitHub Actions（`.github/workflows/server-docker.yml`），使用 GitHub 内置 `GITHUB_TOKEN` 自动编译 `linux/amd64` 与 `linux/arm64` 服务端并推送到 `ghcr.io/huanhq99/flixdesk-server:latest`，无需配置任何第三方 Token。
 
-镜像发布后，在服务器上直接拉取并启动即可（无需在服务器编译 C++）：
+在服务器上直接拉取并启动即可（无需在服务器编译 C++）：
 
 ```bash
 cd server

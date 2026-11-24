@@ -78,7 +78,7 @@ updates = {
     "COTURN_STATELESS_NONCE_SECRET": sys.argv[7],
     "ADMIN_USERNAME": sys.argv[8],
     "ADMIN_PASSWORD": sys.argv[9],
-    "CROSSDESK_IMAGE": "huanhq99/flixdesk-server:latest",
+    "CROSSDESK_IMAGE": "ghcr.io/huanhq99/flixdesk-server:latest",
     "COTURN_REALM": "flixdesk",
 }
 
