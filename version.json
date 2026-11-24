@@ -1,10 +1,27 @@
 {
-  "latest_version": "1.7.7-20261124",
-  "version": "1.7.7-20261124",
+  "latest_version": "1.7.8-20261124",
+  "version": "1.7.8-20261124",
   "releaseDate": "2026-11-24",
   "patch": 0,
-  "tagName": "v1.7.7-20261124",
-  "releaseName": "Flixdesk v1.7.7",
-  "releaseNotes": "Flixdesk Apple-style UI release.",
-  "downloads": {}
+  "tagName": "v1.7.8-20261124",
+  "releaseName": "Flixdesk v1.7.8-20261124",
+  "releaseNotes": "Flixdesk v1.7.8：苹果风 UI + 内置新版本自动检测与提醒（Win/Mac 双端）",
+  "downloads": {
+    "macos-arm64": {
+      "url": "https://github.com/huanhq99/Flixdesk/releases/download/v1.7.8-20261124/flixdesk-macos-arm64-v1.7.8-20261124.pkg",
+      "filename": "flixdesk-macos-arm64-v1.7.8-20261124.pkg",
+      "version": "1.7.8-20261124",
+      "releaseDate": "2026-11-24",
+      "size": 28286064,
+      "sha256": "27420a23e222984eb52dcab2085027680bd4cdb1d46fafa5dadda46ecf58db20"
+    },
+    "windows-x64": {
+      "url": "https://github.com/huanhq99/Flixdesk/releases/download/v1.7.8-20261124/flixdesk-win-x64-v1.7.8-20261124.exe",
+      "filename": "flixdesk-win-x64-v1.7.8-20261124.exe",
+      "version": "1.7.8-20261124",
+      "releaseDate": "2026-11-24",
+      "size": 19868734,
+      "sha256": "b7aaa2fd4772275dd99d6a23d5615f6e50d769193eb2a33c7ff3bc927c83ac00"
+    }
+  }
 }
